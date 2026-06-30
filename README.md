@@ -1,294 +1,633 @@
 # SchemaEvo
 
-Fixed-call schema evolution for multi-module LLM prompt programs.
+Fixed-call schema evolution for multi-module LLM programs.
 
-This repository implements the prompt-optimization method from the supplied implementation plan: evolve typed intermediate schema contracts, validators, and downstream consumption rules while preserving the deployment call graph.
-
-## Visual Overview
-
-SchemaEvo changes the typed intermediate contracts between existing program modules. The optimizer can improve what modules emit and consume, but it does not add LLM calls, retrieval calls, tools, demos, or test-label access.
+SchemaEvo optimizes the typed intermediate contracts between existing LLM
+modules. It can add, remove, rename, type, validate, and route schema fields,
+then teach downstream modules how to consume those fields. It does not change
+the deployed call graph, target model, retriever budget, demo IDs, data splits,
+or final metric.
 
 ![SchemaEvo fixed-call architecture](docs/images/schemaevo-architecture.svg)
 
-The fixed-pool path evaluates a frozen set of schema candidates. The closed-loop path keeps the same deployment boundary, then searches with legal mutations, shared minibatches, budget gates, and Pareto tracking.
+The repository contains a local deterministic toy benchmark, a fixed-pool
+optimizer, a closed-loop schema optimizer, OpenAI Responses API and DSPy
+adapters, HotpotQA/HoVer loaders, cost/budget accounting, statistical reports,
+and experiment drivers for causal pilots, composability, budget/Pareto reports,
+and cross-model transfer.
 
 ![SchemaEvo optimizer loop](docs/images/schemaevo-loop.svg)
 
-## Scope
+## Current Status
 
 Implemented:
 
-- One-page SOTA pre-registration in `PRE_REGISTRATION.md`.
-- Schema candidate representation, token-budget checks, legal mutation grammar, and forbidden mutation guardrails.
-- Human semantic templates, random same-capacity controls, and train-only trace-based schema proposals.
-- Optional OpenAI reflective schema proposer using `gpt-4.1-mini` and Structured Outputs.
-- Failure-tolerant proposal parsing: malformed OpenAI fields/schemas are dropped and recorded instead of aborting pool construction.
-- Schema compiler that patches module output signatures and inserts schema contracts into frozen prompts.
-- Automated call-graph invariants for module order, LLM-call count, retriever-call count, retrieval top-k, and fixed few-shot/demo IDs.
-- Pydantic-backed local validation plus executable constraints (`non_empty`, `regex`, numeric ranges, max tokens/items) and known HoVer/HotpotQA object-field shape checks with deterministic coercion only; no uncounted LLM repair.
-- Per-call logging, rollout cache, cost ledger structures, configurable provider prices, optional `tiktoken` accounting, hard token/call/dollar budget caps, per-example prediction/score rows, latency/token accounting, bootstrap LCB selection, paired bootstrap, approximate randomization, multiple-comparison correction, and field masking/blanking/shuffling/downstream-disabled ablations.
-- Generic closed-loop SchemaEvo optimizer with population initialization, all grammar operators sampled, UCB-style parent/operator allocation, optional successive-halving promotion, paired minibatch evaluation per rung, significance-aware Pareto tracking, rejected-schema audit records, and final candidate selection.
-- Local HotpotQA/HoVer JSON/JSONL loaders and scorers, DSPy and OpenAI Responses API adapters to `LMProgram`, a benchmark readiness preflight, and a composability harness that can run an external prompt optimizer first and then run SchemaEvo as the additive schema layer.
-- Phase-report drivers for causal pilot go/no-go, real-data closed-loop, external GEPA/MIPRO-style composability, budget/Pareto aggregation, cross-model schema transfer, and deployment-cost invariance.
-- A local deterministic toy multi-hop program that exercises the full fixed-pool SchemaEvo path without external APIs or benchmark data.
+- `LMProgram` and `ModuleSpec` abstractions for ordered multi-module programs.
+- `SchemaCandidate`, typed fields, consumption rules, validators, and stable
+  JSONL serialization.
+- Fixed-pool SchemaEvo MVP with train-only proposals, human templates, random
+  controls, validator-only controls, smoke/selection/confirmation/heldout
+  stages, paired tests, Benjamini-Hochberg correction, and field ablations.
+- Closed-loop SchemaEvo search with legal mutations, parent/operator allocation,
+  optional successive halving, budget gates, rejected-schema audit records, and
+  Pareto tracking.
+- OpenAI Responses API module runner with strict structured JSON outputs.
+- Optional OpenAI schema proposer for reflective train-trace-only proposals.
+- DSPy adapter for wrapping DSPy-style callables as SchemaEvo modules.
+- HotpotQA and HoVer local JSON/JSONL loaders, scorers, and readiness checks.
+- Per-call logs, output payloads, score rows, rollout cache, cost ledgers,
+  token/dollar/call caps, and progress renderers.
+- CLI drivers and Make targets for toy runs, OpenAI fixed-pool runs, causal
+  pilots, OpenAI closed-loop runs, composability, cross-model transfer, and
+  budget/Pareto aggregation.
 
-Intentionally not implemented yet:
+Not claimed here:
 
-- GEPA/GEPA+Merge reproduction.
-- Published HotpotQA/HoVer benchmark evidence from downloaded data and real model credentials.
-- Competing prompt optimization methods or benchmark baselines such as MIPROv2, CAPO, ADOPT, Trace/Opto, PCO, BO, Hyperband, or prompt-only GEPA.
+- This repository does not include a built-in GEPA or MIPRO implementation.
+  The composability path expects an external prompt optimizer command.
+- The CLI does not download benchmark data as part of real runs. HotpotQA helper
+  scripts are provided, but benchmark files are treated as local inputs.
+- The README does not claim benchmark-scale SOTA results. `PRE_REGISTRATION.md`
+  defines the claim criteria and reporting requirements for those experiments.
 
-Those are experimental/benchmarking tasks. The repository now has adapters/loaders/harnesses needed
-to wire them, but it does not claim benchmark evidence until those external runs are configured and
-executed.
+## Installation
 
-## Quick Start
+SchemaEvo requires Python 3.11 or newer.
+
+```bash
+python3 -m pip install -e '.[dev]'
+```
+
+For OpenAI-backed runs and tokenizer accounting:
+
+```bash
+python3 -m pip install -e '.[api,dev]'
+export OPENAI_API_KEY=...
+```
+
+After an editable install, the `schemaevo` console script is available. All
+examples below use `python3 -m schemaevo.cli` so they also work directly from a
+source checkout.
+
+## Quick Start: Local No-API Runs
+
+Run tests:
 
 ```bash
 python3 -m pytest -q
-python3 -m schemaevo.cli run-toy-mvp --config configs/toy_schemaevo.yaml --workers 2 --progress rich --out artifacts/toy_mvp
-python3 -m schemaevo.cli run-toy-closed-loop --config configs/toy_schemaevo.yaml --out artifacts/toy_closed_loop
 ```
 
-Or:
+Run the deterministic fixed-pool toy benchmark:
+
+```bash
+python3 -m schemaevo.cli run-toy-mvp \
+  --config configs/toy_schemaevo.yaml \
+  --workers 2 \
+  --progress auto \
+  --out artifacts/toy_mvp
+```
+
+Run the deterministic closed-loop optimizer:
+
+```bash
+python3 -m schemaevo.cli run-toy-closed-loop \
+  --config configs/toy_schemaevo.yaml \
+  --progress auto \
+  --out artifacts/toy_closed_loop
+```
+
+Equivalent Make targets:
 
 ```bash
 make test
 make run-toy-mvp
 make run-toy-closed-loop
-make check-benchmark-readiness HOTPOTQA=/path/to/hotpot.json HOVER=/path/to/hover.jsonl
-make run-openai-fixed-pool \
-  CONFIG=configs/mvp_hotpotqa_gpt41mini.yaml \
-  DATASET=hotpotqa \
-  TRAIN=/path/to/hotpot_train.json \
-  SELECTION=/path/to/hotpot_dev_selection.json \
-  CONFIRMATION=/path/to/hotpot_dev_confirmation.json \
-  MODEL=gpt-4.1-mini \
-  OUT=artifacts/openai_fixed_pool_hotpotqa
 ```
 
-The toy run writes a frozen schema pool, per-call logs, per-example prediction/score rows with call/token/dollar/latency counters, payloads, cost ledgers, and `artifacts/toy_mvp/results/mvp_summary.json`.
-Fixed-pool candidate batches support process-level parallelism with `--workers N` or `WORKERS=N`.
-Progress rendering is controlled with `--progress {auto,rich,tqdm,none}` or `PROGRESS=...`; progress
-is written to stderr so stdout remains JSON. `auto` uses Rich on interactive terminals and disables
-itself in non-TTY automation. Runs with hard budget caps stay serial to preserve exact budget gating.
+The toy task is intentionally small and deterministic. It exercises the full
+SchemaEvo machinery without external APIs or downloaded benchmark data.
 
-To use the real LLM proposer, install the API extra, set `OPENAI_API_KEY`, and switch the config:
+## How SchemaEvo Works
+
+### Program Boundary
+
+The core runtime object is `LMProgram`:
+
+- A program has ordered `ModuleSpec` modules.
+- Each module declares input fields, output fields, prompt text, model,
+  `max_output_tokens`, target LLM call count, retriever call count, and optional
+  demo IDs.
+- A module runner returns a JSON-like dictionary.
+- SchemaEvo compiles a candidate by appending a marked schema contract block to
+  module prompts and extending output signatures with evolved fields.
+
+The compiler clones the base program, preserves model settings and output-token
+caps, and only extends module output signatures with schema fields. The
+invariant check then verifies the deployment call graph: module order, LLM call
+counts, retriever call counts, retriever top-k, and demo IDs remain unchanged.
+
+### Fixed-Pool Path
+
+`run_fixed_pool_schema_mvp` follows a frozen-candidate evaluation protocol:
+
+1. Validate that schema proposal traces are train-only and split IDs do not
+   overlap.
+2. Build a schema pool from trace proposals, random controls, task templates,
+   and a validator-only control.
+3. Run static grammar and token-budget checks.
+4. Compile every surviving candidate into the fixed program boundary.
+5. Evaluate a baseline on the selection split.
+6. Optionally smoke-test schema validity.
+7. Evaluate candidates on the selection split.
+8. Rank by lower confidence bound, with cost and invalidity penalties.
+9. Confirm the top candidates on a held-out confirmation split.
+10. Treat the selection-ranked top candidate as the primary candidate.
+11. Run paired bootstrap, approximate randomization, and optional
+    Benjamini-Hochberg correction.
+12. Optionally evaluate the primary schema on a third held-out test split.
+13. Run field mask, blank, shuffle, and downstream-disabled ablations.
+
+### Closed-Loop Path
+
+`schema_evo_optimize` searches rather than evaluating a frozen pool:
+
+- Seeds a population from supplied schemas, human templates, and random
+  controls.
+- Samples deterministic shared minibatches.
+- Compiles and evaluates candidates under the same call-graph invariant.
+- Selects parents with `uniform_top_k`, `ucb`, or `thompson`.
+- Samples legal mutation operators such as add/drop/rename field, change type,
+  split/merge fields, tighten/relax validators, move producer modules, and add
+  or remove downstream consumption rules.
+- Optionally promotes candidates through successive-halving rungs.
+- Tracks a Pareto frontier over score, cost, tokens, invalidity, and latency.
+- Writes rejected-schema audit records with reasons.
+
+Forbidden mutations include adding LLM calls, adding retrieval calls, increasing
+retriever top-k, adding self-consistency, adding tools, exposing labels or gold
+evidence, changing the final metric, changing the target model, or changing data
+splits.
+
+## CLI Reference
+
+Show the available commands:
 
 ```bash
-python3 -m pip install -e '.[api]'
+python3 -m schemaevo.cli --help
 ```
 
-```yaml
-proposer:
-  kind: openai
-  model: gpt-4.1-mini
-```
+Commands:
 
-By default token counting uses a deterministic local proxy so tests and toy runs never perform
-network-backed tokenizer setup. For production accounting with `tiktoken`, install the API extra and
-set:
+| Command | Purpose |
+| --- | --- |
+| `run-toy-mvp` | Local deterministic fixed-pool demo. |
+| `run-toy-closed-loop` | Local deterministic closed-loop demo. |
+| `check-benchmark-readiness` | Check API packages, `OPENAI_API_KEY`, dataset readability, split quality, and context coverage. |
+| `run-openai-fixed-pool` | Run fixed-pool SchemaEvo on local HotpotQA or HoVer files with OpenAI module runners. |
+| `run-openai-causal-pilot` | Run a fixed-pool pilot and write causal field-ablation plus deployment-invariance reports. |
+| `run-openai-closed-loop` | Run closed-loop SchemaEvo on local HotpotQA or HoVer files with OpenAI module runners. |
+| `run-openai-composability` | Run an external prompt optimizer first, then SchemaEvo as an additive schema layer. |
+| `run-openai-cross-model-transfer` | Optimize on one model, transfer the chosen schema, and evaluate it on another model. |
+| `write-budget-pareto-report` | Aggregate completed run summaries into JSON, CSV, and Markdown budget/Pareto reports. |
+
+Progress rendering is controlled with `--progress {auto,rich,tqdm,none}`.
+Progress output goes to stderr so stdout remains JSON. Independent fixed-pool
+candidates can run in separate processes with `--workers N`; budget-capped runs
+stay serial so hard gates remain exact.
+
+## OpenAI Benchmark Workflow
+
+Install API dependencies and set credentials:
 
 ```bash
-export SCHEMAEVO_USE_TIKTOKEN=1
+python3 -m pip install -e '.[api,dev]'
+export OPENAI_API_KEY=...
 ```
 
-Rollouts are cached under each artifact directory using a fingerprint of the compiled program,
-schema, example ID, seed, and intervention ID.
+Strict OpenAI fixed-pool runs require:
 
-For real benchmark preflight:
+- `OPENAI_API_KEY`.
+- The `openai` package.
+- The `tiktoken` package.
+- `--use-tiktoken-costing`.
+- Nonzero input and output prices for the selected model.
+- A price source/date label.
+- Local data with full question/claim, answer/label, context coverage, and no
+  overlapping example IDs across runtime splits.
+
+Run readiness checks:
 
 ```bash
 python3 -m schemaevo.cli check-benchmark-readiness \
-  --hotpotqa /path/to/hotpot.json \
+  --hotpotqa /path/to/hotpotqa.json \
   --hover /path/to/hover.jsonl \
   --strict
 ```
 
-This validates `OPENAI_API_KEY`, optional API packages, and local dataset readability. It does not
-download datasets or claim benchmark results.
+If you need a cheap HotpotQA pilot split, use one of the helper scripts:
 
-By default the preflight requires non-empty context fields for HotpotQA/HoVer so a question/answer-only
-file cannot accidentally be treated as benchmark evidence. For a pipeline smoke run on contextless
-data, pass `--allow-contextless`. `run-openai-fixed-pool` performs the same quality checks on every
-supplied runtime split (`train`, optional `smoke`, `selection`, `confirmation`, and optional
-`heldout`) before launching model calls, and rejects overlapping example IDs across those splits.
+```bash
+python3 -m pip install datasets
+python3 scripts/fetch_hotpotqa_hf.py
+```
 
-Once readiness passes, a local-data OpenAI fixed-pool run can be launched with:
+or, from an already-downloaded HotpotQA distractor JSON file:
+
+```bash
+python3 scripts/make_pilot_splits.py /path/to/hotpot_dev_distractor_v1.json
+```
+
+Both scripts write:
+
+- `data/hotpotqa/train.json`
+- `data/hotpotqa/selection.json`
+- `data/hotpotqa/confirmation.json`
+
+Run a small causal pilot:
+
+```bash
+python3 -m schemaevo.cli run-openai-causal-pilot \
+  --config configs/pilot_hotpotqa_gpt41mini.yaml \
+  --dataset hotpotqa \
+  --train data/hotpotqa/train.json \
+  --selection data/hotpotqa/selection.json \
+  --confirmation data/hotpotqa/confirmation.json \
+  --model gpt-4.1-mini \
+  --use-tiktoken-costing \
+  --input-price-per-million <input_price> \
+  --output-price-per-million <output_price> \
+  --price-source-date <price_source_date> \
+  --out artifacts/causal_pilot_hotpotqa
+```
+
+Run a full fixed-pool benchmark path:
 
 ```bash
 python3 -m schemaevo.cli run-openai-fixed-pool \
   --config configs/mvp_hotpotqa_gpt41mini.yaml \
   --dataset hotpotqa \
-  --train /path/to/hotpot_train.json \
-  --selection /path/to/hotpot_dev_selection.json \
-  --confirmation /path/to/hotpot_dev_confirmation.json \
-  --heldout /path/to/hotpot_test.json \
-  --use-tiktoken-costing \
-  --input-price-per-million <input_price> \
-  --output-price-per-million <output_price> \
-  --max-target-task-calls <call_budget> \
-  --model gpt-4.1-mini \
-  --out artifacts/openai_fixed_pool
-```
-
-For a combined HotpotQA or HoVer JSON with top-level `train`, `smoke`, `selection`, `confirmation`,
-`heldout_validation`, and/or `test` keys, pass the same file to each split flag; the loaders map
-runtime splits to the matching source section. Prices are intentionally not hardcoded; set them from
-the provider price sheet you want the artifact to represent. Strict OpenAI fixed-pool runs require
-`tiktoken` costing plus nonzero input and output prices for the selected model; pass `--allow-unready`
-only for dry development or injected-client tests. Fixed-pool runs
-also accept `--max-target-task-calls`, `--max-prompt-tokens`, `--max-completion-tokens`,
-`--max-total-tokens`, and `--max-dollar-cost`; the optimizer trims optional candidate/ablation work
-while reserving enough budget for the paired confirmation gate. Token and dollar gates use a
-preflight estimate from module prompts, example inputs, configured tokenizer/prices, and declared
-`max_output_tokens` before starting additional candidate evaluations.
-When an OpenAI schema proposer is configured, its proposal call usage is captured separately as
-`proposal_usage` and included in fixed-pool `cost_summary`/`budget` totals.
-
-The repository includes MVP config templates for the first real-data runs:
-
-- `configs/mvp_hotpotqa_gpt41mini.yaml`
-- `configs/mvp_hover_gpt41mini.yaml`
-
-This uses OpenAI module runners and the fixed-pool SchemaEvo path. It still does not run or compare
-GEPA/MIPRO; those remain external prompt optimizers for the composability harness.
-
-## Phase Drivers
-
-Phase 0 pre-registration:
-
-```bash
-cat PRE_REGISTRATION.md
-```
-
-Causal pilot with automatic mask/shuffle go/no-go and deployment invariance reports:
-
-```bash
-python3 -m schemaevo.cli run-openai-causal-pilot \
-  --config configs/mvp_hotpotqa_gpt41mini.yaml \
-  --dataset hotpotqa \
-  --train /path/to/hotpot_train.json \
-  --smoke /path/to/hotpot_smoke.json \
-  --selection /path/to/hotpot_selection.json \
-  --confirmation /path/to/hotpot_confirmation.json \
-  --heldout /path/to/hotpot_heldout.json \
+  --train /path/to/train.json \
+  --smoke /path/to/smoke.json \
+  --selection /path/to/selection.json \
+  --confirmation /path/to/confirmation.json \
+  --heldout /path/to/heldout.json \
   --model gpt-4.1-mini \
   --use-tiktoken-costing \
   --input-price-per-million <input_price> \
   --output-price-per-million <output_price> \
-  --price-source-date <price_sheet_date> \
+  --cached-input-price-per-million <cached_input_price> \
+  --price-source-date <price_source_date> \
+  --max-dollar-cost <cap> \
   --workers 4 \
-  --out artifacts/causal_pilot_hotpotqa
+  --out artifacts/openai_fixed_pool_hotpotqa
 ```
 
-Real-data closed-loop on HotpotQA or HoVer:
+For HoVer, switch `--dataset hover`, use `configs/mvp_hover_gpt41mini.yaml`,
+and provide HoVer-shaped local files.
+
+Run closed-loop SchemaEvo on local benchmark files:
 
 ```bash
 python3 -m schemaevo.cli run-openai-closed-loop \
   --config configs/toy_schemaevo.yaml \
   --dataset hover \
-  --optimizer /path/to/hover_selection.json \
-  --confirmation /path/to/hover_confirmation.json \
-  --heldout /path/to/hover_heldout.json \
+  --optimizer /path/to/optimizer.jsonl \
+  --confirmation /path/to/confirmation.jsonl \
+  --heldout /path/to/heldout.jsonl \
   --model gpt-4.1-mini \
   --use-tiktoken-costing \
   --input-price-per-million <input_price> \
   --output-price-per-million <output_price> \
+  --price-source-date <price_source_date> \
   --out artifacts/openai_closed_loop_hover
 ```
 
-External GEPA/MIPRO-style composability. The external command receives
-`SCHEMAEVO_INPUT_PROGRAM` and must write `SCHEMAEVO_OUTPUT_PROGRAM` with patched module prompts:
+The closed-loop command reads the `closed_loop` block from the config when
+present. If that block is absent, dataclass defaults are used after CLI
+overrides.
+
+## External Prompt Optimizer Composability
+
+SchemaEvo does not implement GEPA or MIPRO internally. Instead, the
+composability command runs an external optimizer command and then runs
+SchemaEvo on the optimized prompts.
 
 ```bash
 python3 -m schemaevo.cli run-openai-composability \
   --config configs/toy_schemaevo.yaml \
   --dataset hotpotqa \
-  --schema-optimizer /path/to/hotpot_selection.json \
-  --eval /path/to/hotpot_confirmation.json \
+  --schema-optimizer /path/to/schema_optimizer_split.json \
+  --eval /path/to/eval_split.json \
   --model gpt-4.1-mini \
   --prompt-optimizer-name gepa \
   --prompt-optimizer-command "python /path/to/run_gepa_bridge.py" \
   --use-tiktoken-costing \
   --input-price-per-million <input_price> \
   --output-price-per-million <output_price> \
+  --price-source-date <price_source_date> \
   --out artifacts/gepa_plus_schemaevo_hotpotqa
 ```
 
-Cross-model schema transfer:
+The external command receives:
+
+- `SCHEMAEVO_PROMPT_OPTIMIZER`
+- `SCHEMAEVO_INPUT_PROGRAM`
+- `SCHEMAEVO_OUTPUT_PROGRAM`
+
+It must read the input program JSON, write the output program JSON, and preserve
+the deployment graph. By default demo IDs must also remain unchanged. Pass
+`--allow-demo-changes` only when the comparison should permit demo changes while
+still preserving the deployment graph.
+
+## Cross-Model Transfer
+
+Optimize a schema on a source model, compile the selected schema into a target
+model program, and evaluate transfer retention:
 
 ```bash
 python3 -m schemaevo.cli run-openai-cross-model-transfer \
   --config configs/mvp_hotpotqa_gpt41mini.yaml \
   --dataset hotpotqa \
-  --train /path/to/hotpot_train.json \
-  --selection /path/to/hotpot_selection.json \
-  --confirmation /path/to/hotpot_confirmation.json \
+  --train /path/to/train.json \
+  --selection /path/to/selection.json \
+  --confirmation /path/to/confirmation.json \
+  --heldout /path/to/heldout.json \
   --source-model gpt-4.1-mini \
   --target-model <target_model> \
   --use-tiktoken-costing \
   --input-price-per-million <input_price> \
   --output-price-per-million <output_price> \
+  --price-source-date <price_source_date> \
   --out artifacts/cross_model_transfer_hotpotqa
 ```
 
-Budget/Pareto aggregation from completed run summaries:
+## Budget and Pareto Reports
+
+Aggregate completed summary files:
 
 ```bash
 python3 -m schemaevo.cli write-budget-pareto-report \
-  --run gepa=artifacts/gepa/results/summary.json \
+  --run baseline=artifacts/baseline/results/summary.json \
   --run schemaevo=artifacts/openai_fixed_pool_hotpotqa/results/mvp_summary.json \
   --out artifacts/budget_pareto
 ```
 
-## Method Path
+This writes:
 
-The implemented fixed-pool MVP follows the plan:
+- `budget_pareto_report.json`
+- `budget_pareto_report.csv`
+- `budget_pareto_report.md`
 
-1. Accept a reproduced fixed-call base program supplied by the user or adapter.
-2. Collect train-only traces.
-3. Generate a frozen schema pool from trace proposals, random controls, human templates, and validator-only control.
-4. Optionally run train-trace-only reflection rounds that propose more schemas from the current primary schema context without exposing validation labels to the proposer.
-5. Compile every schema into the same program call graph with frozen prompt text.
-6. Smoke-test schema validity and call-count invariants.
-7. Score surviving candidates on a selection split.
-8. Select by lower confidence bound minus cost and invalid-output penalties.
-9. Confirm top candidates on a held-out confirmation split.
-10. Treat the selection-ranked top candidate as the pre-committed primary candidate.
-11. Compare all confirmed candidates against the fixed-schema reference with paired tests and Benjamini-Hochberg correction.
-12. Optionally score the pre-committed winner once on a third held-out test split.
-13. Run field masking, blanking, shuffling, and downstream-disabled ablations on the primary schema.
+## Data Formats
 
-The closed-loop optimizer then extends this with:
+The HotpotQA and HoVer loaders accept JSON or JSONL. JSON files may be:
 
-1. Initialize a schema population from supplied schemas, human templates, and random controls.
-2. Evaluate candidates on deterministic shared minibatches, or on a cheap shared rung followed by larger shared-batch promotion.
-3. Select parents by uncertainty-aware value plus field-use signal.
-4. Apply legal schema mutations only.
-5. Reject duplicate or statically invalid schemas with auditable reasons.
-6. Maintain a Pareto front over score, cost, tokens, invalidity, and latency.
-7. Enforce configured call/token/dollar caps before starting additional candidate evaluations.
-8. Return final Pareto candidates without changing the call graph or demo IDs.
+- A list of records.
+- A dictionary with `data`, `examples`, or `records`.
+- A dictionary keyed by split names such as `train`, `smoke`, `selection`,
+  `confirmation`, `heldout_validation`, or `test`.
 
-## Adapter Boundary
+HotpotQA records should contain:
 
-The core abstraction is `LMProgram` with ordered `ModuleSpec` objects. A DSPy adapter can map each DSPy module to a `ModuleSpec` runner while preserving the same module sequence, target model settings, retriever calls, and top-k. The OpenAI adapter builds `ModuleSpec` runners that call the Responses API with structured JSON output schemas for each module. The compiler does not add modules or calls; it only appends a marked schema contract block to each module prompt and extends output signatures.
+- `_id` or `id`
+- `question`
+- `answer` or `gold`
+- `context`
 
-Local HotpotQA and HoVer loaders/scorers live in `schemaevo.datasets`. They expect already-downloaded JSON or
-JSONL files and convert records into `ProgramExample`s. The composability harness in
-`schemaevo.experiments` accepts an external prompt optimizer callable, checks that it preserves the
-call graph/demo invariant, then runs SchemaEvo on top of the optimized prompts. It re-scores the
-final SchemaEvo candidates on the same held evaluation examples used for base and prompt-only scores,
-and reports additive deltas plus evaluation and SchemaEvo optimizer budget summaries.
+HoVer records should contain:
 
-## Primary Safety Invariants
+- `uid` or `id`
+- `claim` or `question`
+- `label`, `gold`, or `answer`
+- `evidence`, `context`, or `documents`
 
-- No schema proposal may use non-train traces.
-- No candidate may add LLM calls, retrieval calls, self-consistency, external tools, test labels, gold evidence, final-metric changes, model changes, or data-split changes.
-- Primary validation never performs LLM repair. Deterministic coercion is allowed and logged.
-- Candidate programs must match the base program call graph and demo IDs exactly.
-- Fixed-pool confirmation uses the selection-ranked primary candidate for its main claim; the
-  post-hoc best confirmation candidate is reported separately.
-- Confirmed candidates get paired tests plus Benjamini-Hochberg correction.
-- Field-use ablations are run after selection, not used as a selection bonus in the MVP.
+Runtime split mapping:
+
+| Runtime split | Source key preference |
+| --- | --- |
+| `train` | `train` |
+| `validation_smoke` | `smoke` |
+| `validation_selection` | `selection` |
+| `validation_confirmation` | `confirmation` |
+| `optimizer_validation` | `optimizer_validation` |
+| `heldout_validation` | `heldout_validation` |
+| `final_test` | `heldout_validation`, then `test` |
+| `readiness` | `selection`, `validation`, `dev`, `train`, `test`, `heldout_validation` |
+
+Readiness checks reject duplicate IDs, missing questions/claims, missing
+targets, contextless files, and overlapping example IDs across supplied splits.
+Use `--allow-contextless` only for smoke development, not for benchmark claims.
+
+## Artifacts
+
+Artifact directories are designed for audit and later aggregation.
+
+Common fixed-pool outputs:
+
+| Path | Contents |
+| --- | --- |
+| `schemas/frozen_pool.jsonl` | Frozen schema candidates that survived static checks. |
+| `results/mvp_summary.json` | Main fixed-pool summary, decision, stats, cost, budget, field ablations, and artifact paths. |
+| `results/*_scores.jsonl` | Per-example scores, final outputs, validity, calls, tokens, cost, and latency. |
+| `logs/*.jsonl` | Per-module call logs with prompt/schema hashes, validation data, token counts, and payload paths. |
+| `payloads/<run>/<example>/<module>.json` | Raw module outputs. |
+| `cost_ledgers/*.jsonl` | Per-call cost ledger entries. |
+| `rollout_cache/*.json` | Content-addressed cached predictions keyed by program, schema, example, seed, and intervention. |
+
+Closed-loop outputs:
+
+| Path | Contents |
+| --- | --- |
+| `results/schemaevo_summary.json` | Search config, final schema IDs, rejected schemas, operator weights/counts, and budget summary. |
+| `logs/*.jsonl` | Baseline and candidate call logs. |
+| `payloads/` | Raw module outputs. |
+| `rollout_cache/` | Cached optimizer rollouts. |
+
+Experiment reports:
+
+| Driver | Outputs |
+| --- | --- |
+| `run-openai-causal-pilot` | `causal_pilot_report.json`, `causal_pilot_report.md`, `deployment_invariance_report.json`, `deployment_invariance_report.md`, plus nested fixed-pool artifacts. |
+| `run-openai-composability` | `composability_summary.json`, prompt-optimizer input/output program specs, and nested SchemaEvo artifacts. |
+| `run-openai-cross-model-transfer` | `cross_model_transfer_report.json`, `cross_model_transfer_report.md`, and source/target evaluation artifacts. |
+| `write-budget-pareto-report` | JSON, CSV, and Markdown budget/Pareto report files. |
+
+## Configuration
+
+Configs are YAML mappings. The main sections are:
+
+| Section | Used by | Notes |
+| --- | --- | --- |
+| `fixed_pool` | Toy MVP, OpenAI fixed-pool, causal pilot, cross-model transfer | Parsed into `FixedPoolConfig`. |
+| `closed_loop` or `schema_evo` | Toy closed-loop, OpenAI closed-loop, composability | Parsed into `SchemaEvoConfig`. |
+| `proposer` | Fixed-pool paths | `kind: heuristic` or `kind: openai`; also controls proposer model, temperature, target temperature, and max output tokens. |
+| Split counts | Benchmark drivers | `train_examples`, `smoke_examples`, `selection_examples`, `confirmation_examples`, and `heldout_test_examples` limit loaded examples. |
+| `retriever_top_k` | OpenAI benchmark program builder | Sets metadata and retriever-call accounting for the fixed two-module benchmark program. |
+
+Included configs:
+
+- `configs/toy_schemaevo.yaml`: deterministic local fixed-pool and closed-loop
+  defaults.
+- `configs/pilot_hotpotqa_gpt41mini.yaml`: cheap HotpotQA causal pilot
+  template with a dollar cap.
+- `configs/mvp_hotpotqa_gpt41mini.yaml`: OpenAI HotpotQA fixed-pool template.
+- `configs/mvp_hover_gpt41mini.yaml`: OpenAI HoVer fixed-pool template.
+
+Token accounting defaults to a deterministic local proxy. For production
+accounting, install the API extra and pass `--use-tiktoken-costing`. For schema
+token-budget checks that call `approximate_token_count` directly, you can also
+set:
+
+```bash
+export SCHEMAEVO_USE_TIKTOKEN=1
+```
+
+## Python API
+
+The public package exports the schema dataclasses and optimizer entry points:
+
+```python
+from schemaevo import (
+    FixedPoolConfig,
+    SchemaEvoConfig,
+    run_fixed_pool_schema_mvp,
+    schema_evo_optimize,
+)
+from schemaevo.examples.toy_multihop import (
+    build_toy_program,
+    make_toy_examples,
+    make_toy_traces,
+    toy_scorer,
+)
+
+fixed_pool_result = run_fixed_pool_schema_mvp(
+    base_program=build_toy_program(),
+    train_traces=make_toy_traces(),
+    smoke_examples=make_toy_examples("validation_smoke", 4),
+    selection_examples=make_toy_examples("validation_selection", 12),
+    confirmation_examples=make_toy_examples("validation_confirmation", 20),
+    scorer=toy_scorer,
+    config=FixedPoolConfig(task="toy_multihop", target_model="toy-model"),
+    artifact_dir="artifacts/python_fixed_pool",
+)
+
+closed_loop_result = schema_evo_optimize(
+    base_program=build_toy_program(),
+    examples=make_toy_examples("optimizer_validation", 24),
+    scorer=toy_scorer,
+    config=SchemaEvoConfig(task="toy_multihop"),
+    artifact_dir="artifacts/python_closed_loop",
+)
+```
+
+Useful lower-level modules:
+
+| Module | Purpose |
+| --- | --- |
+| `schemaevo.programs.base` | `LMProgram`, `ModuleSpec`, execution context, predictions. |
+| `schemaevo.programs.compile_schema_program` | Compile schema contracts into a base program. |
+| `schemaevo.programs.call_graph` | Extract and assert deployment invariants. |
+| `schemaevo.schemas.*` | Candidates, grammar, mutations, validators, templates, proposers, serialization. |
+| `schemaevo.eval.*` | Evaluation, logging, stats, cache, cost ledger, budgeting, ablations. |
+| `schemaevo.adapters.openai` | OpenAI Responses API module adapter. |
+| `schemaevo.adapters.dspy` | DSPy-style callable adapter. |
+| `schemaevo.datasets.*` | HotpotQA/HoVer loaders and scorers. |
+| `schemaevo.experiments.*` | Causal pilot, deployment invariance, composability, transfer, and budget/Pareto drivers. |
+
+## Validation and Safety Invariants
+
+SchemaEvo enforces the following safeguards in code:
+
+- Schema proposal traces must come from the train split.
+- Runtime example IDs cannot overlap across train traces, smoke, selection,
+  confirmation, and heldout test examples.
+- Static schema checks enforce allowed modules, allowed field types, token
+  budgets, field count limits, snake_case field names, and known consumers.
+- Candidate programs must preserve the base call graph and demo IDs unless a
+  composability run explicitly allows demo changes.
+- Validation uses Pydantic models plus executable constraints such as
+  `non_empty`, `regex`, numeric `min`/`max`, `max_tokens`, `max_items`, and
+  `one_of`.
+- Validation can use deterministic type coercion. It does not perform uncounted
+  LLM repair.
+- Invalid outputs score as zero when `strict_invalid_policy` is enabled.
+- Field ablations are run after selection and are reported as causal evidence,
+  not used as a selection bonus in the fixed-pool MVP.
+- Selection chooses a pre-committed primary candidate from the selection split.
+  The post-hoc best confirmation candidate is reported separately.
+
+## Repository Layout
+
+```text
+schemaevo/
+  adapters/       OpenAI and DSPy adapters
+  benchmarks/     OpenAI benchmark builders and readiness checks
+  datasets/       HotpotQA/HoVer loaders and scorers
+  eval/           scoring, logging, stats, cache, costs, budgeting, ablations
+  examples/       deterministic toy multi-hop program
+  experiments/    causal pilot, composability, transfer, budget/Pareto reports
+  optimizers/     fixed-pool and closed-loop SchemaEvo optimizers
+  programs/       LMProgram boundary, compiler, call-graph checks
+  schemas/        candidates, grammar, mutations, validators, proposers
+  utils/          progress rendering
+configs/          toy, pilot, and OpenAI MVP config templates
+docs/images/      architecture diagrams used by this README
+scripts/          HotpotQA split preparation helpers
+tests/            core regression tests
+```
+
+## Development
+
+Compile and test:
+
+```bash
+make compile
+make test
+```
+
+Clean the default toy artifact directory:
+
+```bash
+make clean-artifacts
+```
+
+Run one command through Make with overrides:
+
+```bash
+make run-openai-fixed-pool \
+  CONFIG=configs/mvp_hotpotqa_gpt41mini.yaml \
+  DATASET=hotpotqa \
+  TRAIN=/path/to/train.json \
+  SELECTION=/path/to/selection.json \
+  CONFIRMATION=/path/to/confirmation.json \
+  HELDOUT=/path/to/heldout.json \
+  MODEL=gpt-4.1-mini \
+  USE_TIKTOKEN=1 \
+  INPUT_PRICE_PER_MILLION=<input_price> \
+  OUTPUT_PRICE_PER_MILLION=<output_price> \
+  PRICE_SOURCE_DATE=<price_source_date> \
+  OUT=artifacts/openai_fixed_pool_hotpotqa
+```
+
+## Troubleshooting
+
+- `OPENAI_API_KEY is required`: set `OPENAI_API_KEY` before OpenAI proposer or
+  module-runner paths.
+- `strict OpenAI fixed-pool runs require tiktoken costing`: pass
+  `--use-tiktoken-costing` and install `.[api]`.
+- `missing pricing table`: pass `--input-price-per-million`,
+  `--output-price-per-million`, and `--price-source-date`, or configure
+  `fixed_pool.model_prices`.
+- `context coverage ... < 1.0`: the readiness checker found question/answer-only
+  data. Use full-context files for benchmark claims.
+- `example IDs overlap`: split files reuse example IDs. Re-slice the data before
+  running fixed-pool experiments.
+- Parallel fixed-pool evaluation is disabled when hard budget caps are active.
+  This is expected; exact cap enforcement is serial.
+
+## Pre-Registration
+
+`PRE_REGISTRATION.md` defines the intended benchmark claim, primary tasks,
+metrics, split discipline, budget points, win/tie/fail rules, causal pilot
+criteria, and reporting requirements. Treat it as the experiment contract before
+claiming benchmark-scale results.
