@@ -1,0 +1,38 @@
+fixed_pool:
+  task: HoVer
+  target_model: gpt-4.1-mini
+  seed: 0
+  n_trace_schemas: 40
+  n_random_schemas: 10
+  schema_token_budget: 512
+  min_smoke_validity: 0.97
+  top_k_confirmation: 5
+  min_confirmation_delta: 0.015
+  bootstrap_resamples: 10000
+  randomization_swaps: 10000
+  freeze_prompt_text: true
+  allow_only_schema_contract_insert: true
+  strict_invalid_policy: true
+  multiple_comparison_correction: benjamini_hochberg
+  reflection_rounds: 2
+  reflection_schemas_per_round: 5
+  use_tiktoken_costing: true
+  max_target_task_calls: null
+  max_prompt_tokens: null
+  max_completion_tokens: null
+  max_total_tokens: null
+  max_dollar_cost: null
+  workers: 1
+  progress: auto
+train_examples: 150
+smoke_examples: 20
+selection_examples: 100
+confirmation_examples: 500
+heldout_test_examples: 500
+retriever_top_k: 0
+proposer:
+  kind: openai
+  model: gpt-4.1-mini
+  temperature: 0.7
+  target_temperature: 0
+  max_output_tokens: 4096

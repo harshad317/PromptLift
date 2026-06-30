@@ -10,6 +10,8 @@ requires-python = ">=3.11"
 dependencies = [
   "pydantic>=2.0",
   "PyYAML>=6.0",
+  "rich>=13.0",
+  "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]

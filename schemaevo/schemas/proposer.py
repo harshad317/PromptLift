@@ -6,6 +6,7 @@ import os
 import random
 from typing import Any, Protocol
 
+from schemaevo.eval.cost_ledger import CostMeter
 from schemaevo.schemas.candidate import ConsumptionRule, SchemaCandidate, SchemaField
 from schemaevo.schemas.grammar import SchemaGrammar
 from schemaevo.schemas.human_templates import make_hotpotqa_schema_candidate, make_hover_schema_candidate
@@ -123,13 +124,17 @@ class OpenAISchemaProposer:
         max_output_tokens: int = 4096,
         client: Any | None = None,
         raise_on_error: bool = False,
+        cost_meter: CostMeter | None = None,
     ) -> None:
         self.model = model
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
         self.client = client
         self.raise_on_error = raise_on_error
+        self.cost_meter = cost_meter or CostMeter()
         self.last_errors: list[str] = []
+        self.last_usage: dict[str, float | int] = _empty_usage()
+        self.total_usage: dict[str, float | int] = _empty_usage()
 
     def propose(
         self,
@@ -143,36 +148,39 @@ class OpenAISchemaProposer:
     ) -> list[SchemaCandidate]:
         _assert_train_only(traces)
         self.last_errors = []
+        self.last_usage = _empty_usage()
         if n <= 0:
             return []
         try:
             client = self.client or _make_openai_client()
+            system_content = (
+                "You propose SchemaEvo intermediate schema contracts for multi-module "
+                "LLM programs. Return only fields that preserve the fixed call graph: no "
+                "extra LLM calls, no extra retrieval, no self-consistency, no tools, no test "
+                "labels. Use snake_case field names and executable validator constraints "
+                "when possible."
+            )
+            user_content = json.dumps(
+                {
+                    "task": task,
+                    "module_names": module_names,
+                    "schema_count": n,
+                    "schema_token_budget": schema_token_budget,
+                    "train_traces": [trace.__dict__ for trace in traces],
+                },
+                sort_keys=True,
+                ensure_ascii=True,
+            )
             response = client.responses.create(
                 model=self.model,
                 input=[
                     {
                         "role": "system",
-                        "content": (
-                            "You propose SchemaEvo intermediate schema contracts for multi-module "
-                            "LLM programs. Return only fields that preserve the fixed call graph: no "
-                            "extra LLM calls, no extra retrieval, no self-consistency, no tools, no test "
-                            "labels. Use snake_case field names and executable validator constraints "
-                            "when possible."
-                        ),
+                        "content": system_content,
                     },
                     {
                         "role": "user",
-                        "content": json.dumps(
-                            {
-                                "task": task,
-                                "module_names": module_names,
-                                "schema_count": n,
-                                "schema_token_budget": schema_token_budget,
-                                "train_traces": [trace.__dict__ for trace in traces],
-                            },
-                            sort_keys=True,
-                            ensure_ascii=True,
-                        ),
+                        "content": user_content,
                     },
                 ],
                 temperature=self.temperature,
@@ -186,7 +194,15 @@ class OpenAISchemaProposer:
                     }
                 },
             )
-            payload = _extract_response_json(response)
+            response_text = _extract_response_text(response)
+            self.last_usage = _proposal_usage(
+                cost_meter=self.cost_meter,
+                model=self.model,
+                prompt_text=system_content + "\n" + user_content,
+                completion_text=response_text,
+            )
+            self.total_usage = _add_usage(self.total_usage, self.last_usage)
+            payload = _parse_response_json(response_text)
             candidates = _candidates_from_openai_payload(
                 payload=payload,
                 task=task,
@@ -310,7 +326,7 @@ def _proposal_json_schema() -> dict[str, Any]:
     }
 
 
-def _extract_response_json(response: Any) -> dict[str, Any]:
+def _extract_response_text(response: Any) -> str:
     text = getattr(response, "output_text", None)
     if not text:
         output = getattr(response, "output", None)
@@ -326,10 +342,66 @@ def _extract_response_json(response: Any) -> dict[str, Any]:
         text = response.get("output_text")
     if not text:
         raise ValueError("OpenAI response did not contain output_text")
+    return str(text)
+
+
+def _extract_response_json(response: Any) -> dict[str, Any]:
+    return _parse_response_json(_extract_response_text(response))
+
+
+def _parse_response_json(text: str) -> dict[str, Any]:
     parsed = json.loads(text)
     if not isinstance(parsed, dict):
         raise ValueError("OpenAI schema proposal response must be a JSON object")
     return parsed
+
+
+def _empty_usage() -> dict[str, float | int]:
+    return {
+        "optimizer_proposal_calls": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "dollar_cost": 0.0,
+    }
+
+
+def _proposal_usage(
+    *,
+    cost_meter: CostMeter,
+    model: str,
+    prompt_text: str,
+    completion_text: str,
+) -> dict[str, float | int]:
+    prompt_tokens = cost_meter.count_tokens(model=model, text=prompt_text)
+    completion_tokens = cost_meter.count_tokens(model=model, text=completion_text)
+    dollar_cost = cost_meter.compute(
+        model=model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
+    return {
+        "optimizer_proposal_calls": 1,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "dollar_cost": dollar_cost,
+    }
+
+
+def _add_usage(
+    left: dict[str, float | int],
+    right: dict[str, float | int],
+) -> dict[str, float | int]:
+    return {
+        "optimizer_proposal_calls": int(left.get("optimizer_proposal_calls", 0))
+        + int(right.get("optimizer_proposal_calls", 0)),
+        "prompt_tokens": int(left.get("prompt_tokens", 0)) + int(right.get("prompt_tokens", 0)),
+        "completion_tokens": int(left.get("completion_tokens", 0))
+        + int(right.get("completion_tokens", 0)),
+        "total_tokens": int(left.get("total_tokens", 0)) + int(right.get("total_tokens", 0)),
+        "dollar_cost": float(left.get("dollar_cost", 0.0)) + float(right.get("dollar_cost", 0.0)),
+    }
 
 
 def _candidates_from_openai_payload(

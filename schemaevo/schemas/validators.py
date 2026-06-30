@@ -121,6 +121,7 @@ def validate_executable_constraints(
         if field_spec.max_items is not None:
             constraints.setdefault("max_items", field_spec.max_items)
         errors.extend(_check_constraints(field_spec.name, value, constraints))
+        errors.extend(_check_known_object_shape(field_spec, value))
     return errors
 
 
@@ -190,6 +191,110 @@ def _check_constraints(field_name: str, value: Any, constraints: dict[str, Any])
     if "one_of" in constraints and str(value) not in set(map(str, constraints["one_of"])):
         errors.append(f"{field_name}: {value!r} not in one_of {constraints['one_of']}")
     return errors
+
+
+def _check_known_object_shape(field_spec: SchemaField, value: Any) -> list[str]:
+    shape = _known_object_shape(field_spec.name)
+    if not shape:
+        return []
+    if field_spec.type == "array[object]":
+        if not isinstance(value, list):
+            return [f"{field_spec.name}: must be an array of objects"]
+        errors: list[str] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, dict):
+                errors.append(f"{field_spec.name}[{index}]: must be an object")
+                continue
+            errors.extend(
+                _check_object_properties(
+                    path=f"{field_spec.name}[{index}]",
+                    value=item,
+                    shape=shape,
+                )
+            )
+        return errors
+    if field_spec.type == "object":
+        if not isinstance(value, dict):
+            return [f"{field_spec.name}: must be an object"]
+        return _check_object_properties(path=field_spec.name, value=value, shape=shape)
+    return []
+
+
+def _check_object_properties(
+    *,
+    path: str,
+    value: dict[str, Any],
+    shape: dict[str, str],
+) -> list[str]:
+    errors: list[str] = []
+    for key, expected_type in shape.items():
+        if key not in value:
+            errors.append(f"{path}.{key}: missing required property")
+            continue
+        if not _matches_shape_type(value[key], expected_type):
+            errors.append(f"{path}.{key}: expected {expected_type}")
+    return errors
+
+
+def _matches_shape_type(value: Any, expected_type: str) -> bool:
+    if expected_type == "string":
+        return isinstance(value, str)
+    if expected_type == "boolean":
+        return isinstance(value, bool)
+    if expected_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected_type == "array[string]":
+        return isinstance(value, list) and all(isinstance(item, str) for item in value)
+    if expected_type == "array[integer]":
+        return isinstance(value, list) and all(
+            isinstance(item, int) and not isinstance(item, bool) for item in value
+        )
+    return True
+
+
+def _known_object_shape(field_name: str) -> dict[str, str]:
+    if field_name == "claim_atoms":
+        return {
+            "text": "string",
+            "entities": "array[string]",
+            "relation": "string",
+            "needs_evidence_from": "string",
+        }
+    if field_name == "hop_plan":
+        return {
+            "hop_index": "integer",
+            "query_intent": "string",
+            "anchor_entity": "string",
+            "missing_evidence_reason": "string",
+        }
+    if field_name == "evidence_table":
+        return {
+            "title": "string",
+            "sentence": "string",
+            "supports_atom_ids": "array[integer]",
+            "contradicts_atom_ids": "array[integer]",
+            "confidence": "number",
+        }
+    if field_name == "evidence_conflict":
+        return {
+            "has_conflict": "boolean",
+            "conflict_description": "string",
+        }
+    if field_name == "bridge_entities":
+        return {
+            "surface": "string",
+            "role": "string",
+            "confidence": "number",
+        }
+    if field_name == "evidence_needs":
+        return {
+            "needed_fact": "string",
+            "source_hint": "string",
+            "resolved": "boolean",
+        }
+    return {}
 
 
 def _as_mapping(raw_output: Any) -> dict[str, Any]:

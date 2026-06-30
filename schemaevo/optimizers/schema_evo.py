@@ -5,6 +5,7 @@ from pathlib import Path
 import random
 from typing import Any
 
+from schemaevo.eval.budgeting import estimate_evaluation_budget
 from schemaevo.eval.cache import RolloutCache
 from schemaevo.eval.cost_ledger import BudgetLimits, BudgetTracker, CostMeter, make_cost_meter
 from schemaevo.eval.scoring import CandidateEvalResult, Scorer, evaluate_program
@@ -20,6 +21,7 @@ from schemaevo.schemas.human_templates import make_human_minimal_schemas
 from schemaevo.schemas.mutations import Mutation, apply_mutation
 from schemaevo.schemas.random_controls import make_random_schema_controls
 from schemaevo.schemas.serialization import write_json
+from schemaevo.utils.progress import ProgressMode, progress_iter
 
 
 @dataclass(frozen=True)
@@ -52,6 +54,7 @@ class SchemaEvoConfig:
     max_completion_tokens: int | None = None
     max_total_tokens: int | None = None
     max_dollar_cost: float | None = None
+    progress: ProgressMode = "auto"
 
     def __post_init__(self) -> None:
         if self.max_program_rollouts <= 0:
@@ -84,6 +87,19 @@ class SchemaEvoConfig:
             raise ValueError("parent_ucb_exploration must be non-negative")
         if self.operator_ucb_exploration < 0:
             raise ValueError("operator_ucb_exploration must be non-negative")
+        for name in (
+            "max_target_task_calls",
+            "max_prompt_tokens",
+            "max_completion_tokens",
+            "max_total_tokens",
+        ):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.max_dollar_cost is not None and self.max_dollar_cost < 0:
+            raise ValueError("max_dollar_cost must be non-negative")
+        if self.progress not in {"auto", "rich", "tqdm", "none"}:
+            raise ValueError("progress must be one of: auto, rich, tqdm, none")
 
 
 @dataclass(frozen=True)
@@ -197,7 +213,12 @@ def schema_evo_optimize(
         config=config,
     )
 
-    for schema in population_schemas:
+    for schema in progress_iter(
+        population_schemas,
+        total=len(population_schemas),
+        description="schemaevo initial",
+        mode=config.progress,
+    ):
         if rollouts_used >= search_rollout_limit or budget.exhausted:
             break
         record = _compile_and_eval(
@@ -356,23 +377,49 @@ def schema_evo_optimize(
             config=config,
         )
         if promotions:
-            promotion_baseline_result = evaluate_program(
+            promotion_baseline_estimate = estimate_evaluation_budget(
                 program=base_program,
                 examples=optimizer_examples,
-                scorer=scorer,
-                method="schemaevo_promotion_baseline",
-                candidate_id="schemaevo_promotion_baseline",
-                seed=config.seed + 10_000,
-                baseline_program=base_program,
-                strict_invalid_policy=config.strict_invalid_policy,
-                artifact_dir=artifact_root,
                 cost_meter=cost_meter,
-                rollout_cache=rollout_cache,
-                run_id="schemaevo_promotion_baseline",
             )
-            budget.record_result(promotion_baseline_result)
+            if budget.can_start(
+                min_target_task_calls=promotion_baseline_estimate.target_task_calls,
+                min_prompt_tokens=promotion_baseline_estimate.prompt_tokens,
+                min_completion_tokens=promotion_baseline_estimate.completion_tokens,
+                min_dollar_cost=promotion_baseline_estimate.dollar_cost,
+            ):
+                promotion_baseline_result = evaluate_program(
+                    program=base_program,
+                    examples=optimizer_examples,
+                    scorer=scorer,
+                    method="schemaevo_promotion_baseline",
+                    candidate_id="schemaevo_promotion_baseline",
+                    seed=config.seed + 10_000,
+                    baseline_program=base_program,
+                    strict_invalid_policy=config.strict_invalid_policy,
+                    artifact_dir=artifact_root,
+                    cost_meter=cost_meter,
+                    rollout_cache=rollout_cache,
+                    run_id="schemaevo_promotion_baseline",
+                )
+                budget.record_result(promotion_baseline_result)
+            else:
+                rejected.append(
+                    {
+                        "schema_id": "schemaevo_promotion_baseline",
+                        "reason": "budget_exhausted",
+                        "stage": "promotion_baseline",
+                        "budget": budget.summary(),
+                    }
+                )
             promoted_pareto = ParetoFront()
-            for source_record in promotions:
+            promotion_records = promotions if promotion_baseline_result else ()
+            for source_record in progress_iter(
+                promotion_records,
+                total=len(promotion_records),
+                description="schemaevo promotion",
+                mode=config.progress,
+            ):
                 if rollouts_used >= config.max_program_rollouts or budget.exhausted:
                     break
                 promoted = _compile_and_eval(
@@ -923,7 +970,17 @@ def _compile_and_eval(
         )
     )
     min_calls = len(batch) * program.calls_per_example
-    if not budget.can_start(min_target_task_calls=min_calls):
+    estimate = estimate_evaluation_budget(
+        program=program,
+        examples=batch,
+        cost_meter=cost_meter,
+    )
+    if not budget.can_start(
+        min_target_task_calls=min_calls,
+        min_prompt_tokens=estimate.prompt_tokens,
+        min_completion_tokens=estimate.completion_tokens,
+        min_dollar_cost=estimate.dollar_cost,
+    ):
         return {
             "schema_id": schema.schema_id,
             "mutation": mutation.op.value if mutation else None,

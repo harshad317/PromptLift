@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import sys
 
 import pytest
+import yaml
 
 from schemaevo.adapters.dspy import DSpyModuleConfig, dspy_program_to_lm_program
 from schemaevo.adapters.openai import OpenAIModuleConfig, openai_modules_to_lm_program
-from schemaevo.benchmarks.readiness import check_benchmark_readiness
+from schemaevo.benchmarks.readiness import check_benchmark_readiness, check_fixed_pool_split_readiness
 from schemaevo.benchmarks.openai_fixed_pool import (
     OpenAIFixedPoolBenchmarkConfig,
     run_openai_fixed_pool_benchmark,
 )
-from schemaevo.cli import main as cli_main
+from schemaevo.cli import _apply_budget_overrides, main as cli_main
 from schemaevo.datasets.hotpotqa import load_hotpotqa_examples
 from schemaevo.datasets.hover import load_hover_examples
 from schemaevo.datasets.scorers import hotpotqa_exact_match, hover_label_accuracy
+from schemaevo.eval.budgeting import estimate_evaluation_budget
 from schemaevo.eval.cost_ledger import CostMeter, ModelPrice
 from schemaevo.examples.toy_multihop import (
     build_toy_program,
@@ -24,16 +28,30 @@ from schemaevo.examples.toy_multihop import (
 )
 from schemaevo.eval.cache import RolloutCache
 from schemaevo.eval.scoring import evaluate_program
+from schemaevo.experiments.budget_pareto import build_budget_pareto_report
+from schemaevo.experiments.causal_pilot import build_causal_pilot_report
+from schemaevo.experiments.deployment_invariance import build_fixed_pool_deployment_report
+from schemaevo.experiments.external_prompt_optimizer import ExternalPromptOptimizer
 from schemaevo.experiments.composability import run_prompt_optimizer_then_schemaevo
 from schemaevo.optimizers.fixed_pool_schema import FixedPoolConfig, run_fixed_pool_schema_mvp
 from schemaevo.optimizers.schema_evo import SchemaEvoConfig, merge_schema_candidates, schema_evo_optimize
+from schemaevo.programs.base import ProgramExample
 from schemaevo.programs.call_graph import assert_same_call_graph, extract_call_graph
 from schemaevo.programs.compile_schema_program import CONTRACT_START, compile_schema_program
 from schemaevo.schemas.candidate import ConsumptionRule, SchemaCandidate, SchemaField
 from schemaevo.schemas.grammar import MutationOp, SchemaGrammar, assert_legal_mutation
-from schemaevo.schemas.human_templates import make_hotpotqa_schema_candidate, make_human_minimal_schemas
+from schemaevo.schemas.human_templates import (
+    make_hotpotqa_schema_candidate,
+    make_hover_schema_candidate,
+    make_human_minimal_schemas,
+)
 from schemaevo.schemas.mutations import Mutation, apply_mutation
-from schemaevo.schemas.proposer import OpenAISchemaProposer, TraceExample, propose_schemas_from_traces
+from schemaevo.schemas.proposer import (
+    HeuristicTraceSchemaProposer,
+    OpenAISchemaProposer,
+    TraceExample,
+    propose_schemas_from_traces,
+)
 from schemaevo.schemas.serialization import freeze_jsonl, load_jsonl
 from schemaevo.schemas.validators import SchemaValidator
 
@@ -144,6 +162,58 @@ def test_cost_meter_prices_use_recorded_token_counts():
     assert result.completion_tokens > 0
 
 
+def test_score_artifacts_include_predictions_and_per_example_accounting(tmp_path):
+    result = evaluate_program(
+        program=build_toy_program(),
+        examples=make_toy_examples("artifact_audit", 1),
+        scorer=toy_scorer,
+        method="artifact_audit",
+        candidate_id="artifact_audit",
+        seed=1,
+        artifact_dir=tmp_path,
+    )
+
+    rows = [
+        json.loads(line)
+        for line in Path(result.per_example_scores_path).read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert rows[0]["example_id"] == "artifact_audit_0"
+    assert rows[0]["final_output"] == result.predictions[0].final_output
+    assert rows[0]["target_task_calls"] == 2
+    assert rows[0]["retriever_calls"] == 1
+    assert rows[0]["prompt_tokens"] > 0
+    assert rows[0]["completion_tokens"] > 0
+    assert rows[0]["dollar_cost"] >= 0.0
+    assert "latency_ms" in rows[0]
+    assert "validation_errors" in rows[0]
+
+
+def test_evaluation_budget_estimate_uses_token_counter_and_max_outputs():
+    meter = CostMeter(
+        prices={
+            "toy-model": ModelPrice(
+                input_per_million=1.0,
+                output_per_million=2.0,
+                source_date="test",
+            )
+        },
+        token_counter=lambda model, text: max(1, len(text.split())),
+    )
+
+    estimate = estimate_evaluation_budget(
+        program=build_toy_program(),
+        examples=make_toy_examples("budget_estimate", 2),
+        cost_meter=meter,
+    )
+
+    assert estimate.target_task_calls == 4
+    assert estimate.prompt_tokens > 0
+    assert estimate.completion_tokens == 2 * (256 + 128)
+    expected_cost = (estimate.prompt_tokens * 1.0 + estimate.completion_tokens * 2.0) / 1_000_000
+    assert estimate.dollar_cost == pytest.approx(expected_cost)
+
+
 def test_validator_uses_deterministic_coercion_without_llm_repair():
     field = SchemaField(
         name="bridge_entity",
@@ -225,6 +295,36 @@ def test_executable_validator_constraints_reject_bad_values():
     assert any("max" in error for error in result.errors)
 
 
+def test_validator_rejects_malformed_known_object_fields():
+    schema = make_hover_schema_candidate(module_names=("planner", "verifier"))
+
+    result = SchemaValidator(schema).validate_module_output(
+        "planner",
+        {
+            "claim_atoms": [
+                {
+                    "text": "A subclaim.",
+                    "entities": "not-a-list",
+                    "relation": "states",
+                }
+            ],
+            "hop_plan": [],
+            "evidence_table": [],
+            "evidence_conflict": {
+                "has_conflict": "false",
+                "conflict_description": "",
+            },
+            "final_verdict_preconditions": [],
+        },
+        policy="deterministic_coercion",
+    )
+
+    assert not result.valid
+    assert any("claim_atoms[0].entities" in error for error in result.errors)
+    assert any("claim_atoms[0].needs_evidence_from" in error for error in result.errors)
+    assert any("evidence_conflict.has_conflict" in error for error in result.errors)
+
+
 def test_trace_proposer_rejects_non_train_traces():
     with pytest.raises(ValueError, match="train traces only"):
         propose_schemas_from_traces(
@@ -280,7 +380,19 @@ def test_openai_schema_proposer_parses_structured_response():
     class FakeClient:
         responses = FakeResponses()
 
-    proposer = OpenAISchemaProposer(client=FakeClient())
+    proposer = OpenAISchemaProposer(
+        client=FakeClient(),
+        cost_meter=CostMeter(
+            prices={
+                "gpt-4.1-mini": ModelPrice(
+                    input_per_million=1.0,
+                    output_per_million=2.0,
+                    source_date="test",
+                )
+            },
+            token_counter=lambda model, text: max(1, len(text.split())),
+        ),
+    )
     candidates = proposer.propose(
         traces=make_toy_traces(),
         task="toy_multihop",
@@ -292,6 +404,11 @@ def test_openai_schema_proposer_parses_structured_response():
 
     assert candidates[0].metadata["proposer_model"] == "gpt-4.1-mini"
     assert candidates[0].evolved_field_names == ("bridge_entity",)
+    assert proposer.last_usage["optimizer_proposal_calls"] == 1
+    assert proposer.last_usage["prompt_tokens"] > 0
+    assert proposer.last_usage["completion_tokens"] > 0
+    assert proposer.last_usage["dollar_cost"] > 0
+    assert proposer.total_usage == proposer.last_usage
 
 
 def test_openai_schema_proposer_drops_malformed_fields_without_crashing():
@@ -470,9 +587,266 @@ def test_fixed_pool_rejects_split_leakage(tmp_path):
         )
 
 
+def test_fixed_pool_budget_reserves_confirmation_and_trims_candidates(tmp_path):
+    config = FixedPoolConfig(
+        task="toy_multihop",
+        target_model="toy-model",
+        seed=41,
+        n_trace_schemas=8,
+        n_random_schemas=0,
+        top_k_confirmation=1,
+        bootstrap_resamples=10,
+        randomization_swaps=10,
+        max_target_task_calls=10,
+    )
+
+    result = run_fixed_pool_schema_mvp(
+        base_program=build_toy_program(),
+        train_traces=make_toy_traces(),
+        smoke_examples=(),
+        selection_examples=make_toy_examples("validation_selection", 1),
+        confirmation_examples=make_toy_examples("validation_confirmation", 1),
+        scorer=toy_scorer,
+        config=config,
+        artifact_dir=tmp_path,
+    )
+
+    assert result.budget_summary["target_task_calls"] == 10
+    assert result.budget_summary["exhausted"] is True
+    assert len(result.selection_results) == 2
+    assert len(result.confirmation_results) == 1
+    assert result.primary_confirmation_result.schema_id == result.top_selection_results[0].schema_id
+    assert result.field_ablation_results == ()
+
+
+def test_fixed_pool_records_schema_proposal_usage(tmp_path):
+    class AccountingProposer:
+        def __init__(self):
+            self.total_usage = {
+                "optimizer_proposal_calls": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "dollar_cost": 0.0,
+            }
+
+        def propose(self, **kwargs):
+            self.total_usage = {
+                "optimizer_proposal_calls": 1,
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                "total_tokens": 18,
+                "dollar_cost": 0.25,
+            }
+            return HeuristicTraceSchemaProposer().propose(**kwargs)
+
+    result = run_fixed_pool_schema_mvp(
+        base_program=build_toy_program(),
+        train_traces=make_toy_traces(),
+        smoke_examples=(),
+        selection_examples=make_toy_examples("validation_selection", 1),
+        confirmation_examples=make_toy_examples("validation_confirmation", 1),
+        scorer=toy_scorer,
+        config=FixedPoolConfig(
+            task="toy_multihop",
+            target_model="toy-model",
+            seed=43,
+            n_trace_schemas=1,
+            n_random_schemas=0,
+            top_k_confirmation=1,
+            bootstrap_resamples=10,
+            randomization_swaps=10,
+        ),
+        proposer=AccountingProposer(),
+        artifact_dir=tmp_path,
+    )
+
+    assert result.proposal_usage["optimizer_proposal_calls"] == 1
+    assert result.cost_summary["optimizer_proposal_calls"] == 1
+    assert result.cost_summary["prompt_tokens"] >= 11
+    assert result.cost_summary["completion_tokens"] >= 7
+    assert result.cost_summary["dollar_cost"] >= 0.25
+    assert "wall_clock_seconds" in result.cost_summary
+    assert "max_p50_latency_ms" in result.cost_summary
+    assert "max_p95_latency_ms" in result.cost_summary
+    assert result.budget_summary["prompt_tokens"] >= result.cost_summary["prompt_tokens"]
+
+
+def test_fixed_pool_reflection_uses_train_traces_without_validation_leakage(tmp_path):
+    class TwoRoundProposer:
+        def __init__(self):
+            self.calls = []
+            self.total_usage = {
+                "optimizer_proposal_calls": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "dollar_cost": 0.0,
+            }
+
+        def propose(self, **kwargs):
+            self.calls.append(kwargs)
+            self.total_usage = {
+                "optimizer_proposal_calls": len(self.calls),
+                "prompt_tokens": 10 * len(self.calls),
+                "completion_tokens": 5 * len(self.calls),
+                "total_tokens": 15 * len(self.calls),
+                "dollar_cost": 0.01 * len(self.calls),
+            }
+            module_names = kwargs["module_names"]
+            field_name = "bridge_entity" if len(self.calls) == 1 else "next_query_intent"
+            field = SchemaField(
+                name=field_name,
+                type="string",
+                description=f"{field_name} from train-only reflection.",
+                required=True,
+                producer_module=module_names[0],
+                consumer_modules=(module_names[-1],),
+                max_tokens=32,
+                validation_rule="non_empty;max_tokens=32",
+            )
+            candidate = SchemaCandidate(
+                schema_id=f"two_round_{len(self.calls)}",
+                parent_schema_id=None,
+                task=kwargs["task"],
+                module_fields={module_names[0]: (field,)},
+                consumption_rules=(
+                    ConsumptionRule(
+                        consumer_module=module_names[-1],
+                        field_name=field.name,
+                        instruction=f"Use `{field.name}` from the planner.",
+                        required_behavior="Consume without adding calls.",
+                        fallback_if_missing="Use original prompt behavior.",
+                    ),
+                ),
+                validators={field.name: field.validation_rule or ""},
+                schema_token_budget=kwargs["schema_token_budget"],
+                mutation_history=(f"two_round_call={len(self.calls)}",),
+                proposer_seed=kwargs["seed"],
+            )
+            return [candidate.with_id_from_content(prefix=f"two_round_{len(self.calls)}")]
+
+    proposer = TwoRoundProposer()
+    result = run_fixed_pool_schema_mvp(
+        base_program=build_toy_program(),
+        train_traces=make_toy_traces(),
+        smoke_examples=(),
+        selection_examples=make_toy_examples("validation_selection", 4),
+        confirmation_examples=make_toy_examples("validation_confirmation", 4),
+        scorer=toy_scorer,
+        config=FixedPoolConfig(
+            task="toy_multihop",
+            target_model="toy-model",
+            seed=47,
+            n_trace_schemas=1,
+            n_random_schemas=0,
+            top_k_confirmation=1,
+            bootstrap_resamples=10,
+            randomization_swaps=10,
+            reflection_rounds=2,
+            reflection_schemas_per_round=1,
+        ),
+        proposer=proposer,
+        artifact_dir=tmp_path,
+    )
+
+    assert len(proposer.calls) == 2
+    assert all(trace.split == "train" for trace in proposer.calls[1]["traces"])
+    assert all(
+        trace.metadata["source"] == "schemaevo_reflection_train_trace"
+        for trace in proposer.calls[1]["traces"]
+    )
+    assert all("primary_schema_id" in trace.metadata for trace in proposer.calls[1]["traces"])
+    assert result.reflection_rounds[0]["status"] == "evaluated"
+    assert result.cost_summary["optimizer_proposal_calls"] == 2
+    assert result.cost_summary["optimizer_reflection_calls"] == 1
+    assert result.proposal_usage["optimizer_reflection_calls"] == 1
+    assert any(
+        "next_query_intent" in schema.evolved_field_names
+        for schema in result.schema_pool
+        if schema.mutation_history == ("two_round_call=2",)
+    )
+
+
 def test_fixed_pool_config_rejects_invalid_values():
     with pytest.raises(ValueError, match="top_k_confirmation"):
         FixedPoolConfig(top_k_confirmation=0)
+    with pytest.raises(ValueError, match="workers"):
+        FixedPoolConfig(workers=0)
+    with pytest.raises(ValueError, match="progress"):
+        FixedPoolConfig(progress="loud")  # type: ignore[arg-type]
+
+
+def test_fixed_pool_multiprocessing_candidate_eval_runs(tmp_path):
+    result = run_fixed_pool_schema_mvp(
+        base_program=build_toy_program(),
+        train_traces=make_toy_traces(),
+        smoke_examples=(),
+        selection_examples=make_toy_examples("validation_selection", 2),
+        confirmation_examples=make_toy_examples("validation_confirmation", 2),
+        scorer=toy_scorer,
+        config=FixedPoolConfig(
+            task="toy_multihop",
+            target_model="toy-model",
+            seed=53,
+            n_trace_schemas=2,
+            n_random_schemas=0,
+            top_k_confirmation=1,
+            bootstrap_resamples=10,
+            randomization_swaps=10,
+            workers=2,
+            progress="none",
+        ),
+        artifact_dir=tmp_path,
+    )
+
+    assert result.primary_confirmation_result.mean_score == 1.0
+    assert len(result.selection_results) >= 2
+    assert (tmp_path / "results" / "mvp_summary.json").exists()
+
+
+def test_closed_loop_config_rejects_negative_budget_caps():
+    with pytest.raises(ValueError, match="max_prompt_tokens"):
+        SchemaEvoConfig(max_prompt_tokens=-1)
+    with pytest.raises(ValueError, match="max_dollar_cost"):
+        SchemaEvoConfig(max_dollar_cost=-0.01)
+    with pytest.raises(ValueError, match="progress"):
+        SchemaEvoConfig(progress="loud")  # type: ignore[arg-type]
+
+
+def test_mvp_gpt41mini_configs_parse_as_fixed_pool_configs():
+    for config_path in (
+        Path("configs/mvp_hotpotqa_gpt41mini.yaml"),
+        Path("configs/mvp_hover_gpt41mini.yaml"),
+    ):
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        config = FixedPoolConfig(**raw["fixed_pool"])
+
+        assert config.target_model == "gpt-4.1-mini"
+        assert config.freeze_prompt_text
+        assert config.allow_only_schema_contract_insert
+        assert config.reflection_rounds == 2
+        assert config.workers == 1
+        assert config.progress == "auto"
+        assert raw["proposer"]["kind"] == "openai"
+        assert raw["train_examples"] == 150
+        assert raw["confirmation_examples"] == 500
+
+
+def test_cli_budget_overrides_update_fixed_pool_config():
+    config = _apply_budget_overrides(
+        FixedPoolConfig(),
+        max_target_task_calls=10,
+        max_prompt_tokens=None,
+        max_completion_tokens=30,
+        max_total_tokens=None,
+        max_dollar_cost=0.25,
+    )
+
+    assert config.max_target_task_calls == 10
+    assert config.max_prompt_tokens is None
+    assert config.max_completion_tokens == 30
+    assert config.max_dollar_cost == 0.25
 
 
 def test_closed_loop_schemaevo_optimizer_runs_with_fixed_call_graph(tmp_path):
@@ -552,6 +926,30 @@ def test_closed_loop_budget_stops_candidate_evaluations(tmp_path):
 
     assert result.budget_summary["target_task_calls"] <= 8
     assert len(result.evaluated_records) <= 1
+
+
+def test_closed_loop_token_budget_prevents_starting_over_budget_candidates():
+    config = SchemaEvoConfig(
+        task="toy_multihop",
+        seed=31,
+        max_program_rollouts=5,
+        max_mutation_attempts=5,
+        minibatch_size=2,
+        initial_random_schemas=2,
+        k_final=1,
+        max_completion_tokens=500,
+    )
+
+    result = schema_evo_optimize(
+        base_program=build_toy_program(),
+        examples=make_toy_examples("optimizer_validation", 6),
+        scorer=toy_scorer,
+        config=config,
+    )
+
+    assert result.budget_summary["completion_tokens"] <= 500
+    assert not result.evaluated_records
+    assert any(item["reason"] == "budget_exhausted" for item in result.rejected_schemas)
 
 
 def test_schema_merge_combines_complementary_fields():
@@ -691,6 +1089,135 @@ def test_openai_adapter_runs_module_with_structured_response():
     assert output_schema["required"] == ["answer", "confidence"]
 
 
+def test_openai_adapter_emits_strict_object_schemas():
+    calls = []
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+
+            class Response:
+                output_text = json.dumps(
+                    {"items": [{"value": "control"}], "metadata": {"value": "control"}}
+                )
+
+            return Response()
+
+    class FakeClient:
+        responses = FakeResponses()
+
+    program = openai_modules_to_lm_program(
+        task="StrictSchema",
+        modules=(
+            OpenAIModuleConfig(
+                name="collector",
+                input_fields=("question",),
+                output_fields=("items", "metadata"),
+                output_field_types={"items": "array[object]", "metadata": "object"},
+                prompt="Collect structured evidence.",
+                model="gpt-4.1-mini",
+            ),
+        ),
+        final_output_module="collector",
+        client=FakeClient(),
+    )
+
+    program.run(
+        make_toy_examples("strict_schema", 1)[0],
+        run_id="strict_schema",
+        method="strict_schema",
+        candidate_id="strict_schema",
+        seed=0,
+    )
+
+    properties = calls[0]["text"]["format"]["schema"]["properties"]
+    assert properties["items"]["items"]["additionalProperties"] is False
+    assert properties["items"]["items"]["properties"] == {"value": {"type": "string"}}
+    assert properties["items"]["items"]["required"] == ["value"]
+    assert properties["metadata"]["additionalProperties"] is False
+    assert properties["metadata"]["properties"] == {"value": {"type": "string"}}
+    assert properties["metadata"]["required"] == ["value"]
+
+
+def test_openai_adapter_emits_known_nested_object_schemas():
+    calls = []
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+
+            class Response:
+                output_text = json.dumps(
+                    {
+                        "claim_atoms": [
+                            {
+                                "text": "claim",
+                                "entities": ["entity"],
+                                "relation": "related to",
+                                "needs_evidence_from": "source",
+                            }
+                        ],
+                        "evidence_conflict": {
+                            "has_conflict": False,
+                            "conflict_description": "",
+                        },
+                    }
+                )
+
+            return Response()
+
+    class FakeClient:
+        responses = FakeResponses()
+
+    program = openai_modules_to_lm_program(
+        task="HoVer",
+        modules=(
+            OpenAIModuleConfig(
+                name="planner",
+                input_fields=("claim", "context"),
+                output_fields=("claim_atoms", "evidence_conflict"),
+                output_field_types={
+                    "claim_atoms": "array[object]",
+                    "evidence_conflict": "object",
+                },
+                prompt="Plan evidence checks.",
+                model="gpt-4.1-mini",
+            ),
+        ),
+        final_output_module="planner",
+        client=FakeClient(),
+    )
+
+    example = ProgramExample(
+        example_id="hover_nested",
+        split="validation",
+        inputs={"claim": "A claim.", "context": "Evidence."},
+    )
+    prediction = program.run(
+        example,
+        run_id="hover_nested",
+        method="openai_adapter",
+        candidate_id="hover_nested",
+        seed=0,
+    )
+
+    assert prediction.final_output["claim_atoms"][0]["text"] == "claim"
+    properties = calls[0]["text"]["format"]["schema"]["properties"]
+    atom_item = properties["claim_atoms"]["items"]
+    assert atom_item["additionalProperties"] is False
+    assert atom_item["required"] == [
+        "text",
+        "entities",
+        "relation",
+        "needs_evidence_from",
+    ]
+    assert atom_item["properties"]["entities"]["items"]["type"] == "string"
+    conflict = properties["evidence_conflict"]
+    assert conflict["additionalProperties"] is False
+    assert conflict["required"] == ["has_conflict", "conflict_description"]
+    assert conflict["properties"]["has_conflict"]["type"] == "boolean"
+
+
 def test_hotpotqa_and_hover_loaders_read_local_json_files(tmp_path):
     hotpot_path = tmp_path / "hotpot.json"
     hotpot_path.write_text(
@@ -722,6 +1249,133 @@ def test_hotpotqa_and_hover_loaders_read_local_json_files(tmp_path):
     assert hover[0].inputs["claim"] == "Claim."
     assert hover[0].expected["label"] == "SUPPORTED"
     assert hover[0].metadata["dataset"] == "hover"
+
+
+def test_hotpotqa_loader_reads_combined_split_dict(tmp_path):
+    hotpot_path = tmp_path / "hotpot_splits.json"
+    hotpot_path.write_text(
+        json.dumps(
+            {
+                "train": [
+                    {
+                        "id": "train_1",
+                        "question": "Train?",
+                        "gold": "train answer",
+                        "context": [{"title": "Train", "text": "train answer is supported."}],
+                    }
+                ],
+                "selection": [
+                    {
+                        "id": "selection_1",
+                        "question": "Selection?",
+                        "gold": "selection answer",
+                        "question_type": "bridge",
+                        "context": [{"title": "Selection", "text": "selection answer is supported."}],
+                    }
+                ],
+                "confirmation": [
+                    {
+                        "id": "confirmation_1",
+                        "question": "Confirm?",
+                        "gold": "confirm answer",
+                        "context": [{"title": "Confirm", "text": "confirm answer is supported."}],
+                    }
+                ],
+                "heldout_validation": [
+                    {
+                        "id": "heldout_1",
+                        "question": "Heldout?",
+                        "gold": "heldout answer",
+                        "context": [{"title": "Heldout", "text": "heldout answer is supported."}],
+                    }
+                ],
+                "test": [
+                    {
+                        "id": "test_1",
+                        "question": "Test?",
+                        "gold": "test answer",
+                        "context": [{"title": "Test", "text": "test answer is supported."}],
+                    }
+                ],
+                "corpus": [{"id": "doc_1", "title": "Doc", "text": "unused corpus document."}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    selection = load_hotpotqa_examples(hotpot_path, split="validation_selection")
+    final_test = load_hotpotqa_examples(hotpot_path, split="final_test")
+    heldout = load_hotpotqa_examples(
+        hotpot_path,
+        split="final_test",
+        source_split="heldout_validation",
+    )
+    readiness = load_hotpotqa_examples(hotpot_path, split="readiness")
+
+    assert selection[0].example_id == "selection_1"
+    assert selection[0].expected["answer"] == "selection answer"
+    assert selection[0].metadata["type"] == "bridge"
+    assert selection[0].metadata["source_split"] == "selection"
+    assert selection[0].inputs["context"][0]["text"] == "selection answer is supported."
+    assert final_test[0].example_id == "test_1"
+    assert heldout[0].example_id == "heldout_1"
+    assert readiness[0].example_id == "selection_1"
+
+
+def test_hover_loader_reads_combined_split_dict_and_answer_labels(tmp_path):
+    hover_path = tmp_path / "hover_splits.json"
+    hover_path.write_text(
+        json.dumps(
+            {
+                "train": [
+                    {
+                        "id": "train_v1",
+                        "claim": "Train claim.",
+                        "answer": "yes",
+                        "context": [{"title": "Train", "text": "Evidence supports it."}],
+                    }
+                ],
+                "selection": [
+                    {
+                        "id": "selection_v1",
+                        "claim": "Selection claim.",
+                        "gold": "NOT_SUPPORTED",
+                        "evidence": [["Doc", ["Evidence contradicts it."]]],
+                        "num_hops": 2,
+                    }
+                ],
+                "confirmation": [
+                    {
+                        "id": "confirmation_v1",
+                        "claim": "Confirmation claim.",
+                        "label": "SUPPORTED",
+                        "documents": [{"title": "Doc", "text": "Evidence supports it."}],
+                    }
+                ],
+                "test": [
+                    {
+                        "id": "test_v1",
+                        "claim": "Test claim.",
+                        "label": "SUPPORTED",
+                        "context": "Evidence supports it.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    train = load_hover_examples(hover_path, split="train")
+    selection = load_hover_examples(hover_path, split="validation_selection")
+    final_test = load_hover_examples(hover_path, split="final_test")
+
+    assert train[0].expected["label"] == "yes"
+    assert selection[0].example_id == "selection_v1"
+    assert selection[0].expected["label"] == "NOT_SUPPORTED"
+    assert selection[0].metadata["source_split"] == "selection"
+    assert selection[0].metadata["num_hops"] == 2
+    assert selection[0].inputs["context"][0]["text"] == "Evidence contradicts it."
+    assert final_test[0].inputs["context"] == ["Evidence supports it."]
 
 
 def test_benchmark_scorers_normalize_hotpotqa_and_hover_outputs(tmp_path):
@@ -756,7 +1410,7 @@ def test_benchmark_readiness_reports_local_data_and_missing_key(tmp_path, monkey
                     "_id": "h1",
                     "question": "Q?",
                     "answer": "A",
-                    "context": [["Title", ["Sentence."]]],
+                    "context": [],
                 }
             ]
         ),
@@ -766,8 +1420,57 @@ def test_benchmark_readiness_reports_local_data_and_missing_key(tmp_path, monkey
     readiness = check_benchmark_readiness(hotpotqa_path=hotpot_path)
 
     assert not readiness.ready
-    assert readiness.datasets["hotpotqa"]["ok"]
+    assert not readiness.datasets["hotpotqa"]["ok"]
+    assert readiness.datasets["hotpotqa"]["quality"]["context_coverage"] == 0.0
     assert "OPENAI_API_KEY is not set" in readiness.reasons
+    permissive = check_benchmark_readiness(hotpotqa_path=hotpot_path, require_context=False)
+    assert permissive.datasets["hotpotqa"]["ok"]
+
+    hotpot_path.write_text(
+        json.dumps([{"_id": "h1", "question": "Q?", "answer": "A", "context": [["Title", ["Sentence."]]]}]),
+        encoding="utf-8",
+    )
+    contextual = check_benchmark_readiness(hotpotqa_path=hotpot_path, require_context=True)
+    assert contextual.datasets["hotpotqa"]["quality"]["context_coverage"] == 1.0
+
+    hotpot_path.write_text(
+        json.dumps(
+            {
+                "selection": [
+                    {
+                        "id": "selection_1",
+                        "question": "Q?",
+                        "gold": "A",
+                        "context": [{"title": "Title", "text": "Sentence."}],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    split_dict = check_benchmark_readiness(hotpotqa_path=hotpot_path, require_context=True)
+    assert split_dict.datasets["hotpotqa"]["ok"]
+    assert split_dict.datasets["hotpotqa"]["quality"]["target_coverage"] == 1.0
+
+    hover_path = tmp_path / "hover.json"
+    hover_path.write_text(
+        json.dumps(
+            {
+                "selection": [
+                    {
+                        "id": "hover_selection_1",
+                        "claim": "Claim.",
+                        "answer": "yes",
+                        "context": [{"title": "Doc", "text": "Evidence supports it."}],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    hover_ready = check_benchmark_readiness(hover_path=hover_path, require_context=True)
+    assert hover_ready.datasets["hover"]["ok"]
+    assert hover_ready.datasets["hover"]["quality"]["target_coverage"] == 1.0
 
 
 def test_cli_check_benchmark_readiness_strict_fails_without_key(tmp_path, monkeypatch, capsys):
@@ -789,7 +1492,7 @@ def test_cli_check_benchmark_readiness_strict_fails_without_key(tmp_path, monkey
     output = json.loads(capsys.readouterr().out)
 
     assert exit_code == 1
-    assert output["datasets"]["hotpotqa"]["ok"] is True
+    assert output["datasets"]["hotpotqa"]["ok"] is False
     assert output["ready"] is False
 
 
@@ -850,6 +1553,13 @@ def test_openai_fixed_pool_benchmark_runs_with_injected_client(tmp_path):
             top_k_confirmation=1,
             bootstrap_resamples=10,
             randomization_swaps=10,
+            model_prices={
+                "gpt-4.1-mini": {
+                    "input_per_million": 1.0,
+                    "output_per_million": 1.0,
+                    "source_date": "test",
+                }
+            },
         ),
         artifact_dir=tmp_path / "artifacts",
         client=FakeClient(),
@@ -857,7 +1567,129 @@ def test_openai_fixed_pool_benchmark_runs_with_injected_client(tmp_path):
 
     assert result.baseline_confirmation_result.mean_score == 1.0
     assert result.primary_confirmation_result.mean_score == 1.0
+    assert result.cost_summary["prompt_tokens"] > 0
+    assert result.cost_summary["dollar_cost"] > 0
     assert (tmp_path / "artifacts" / "results" / "mvp_summary.json").exists()
+
+
+def test_fixed_pool_split_readiness_checks_all_runtime_splits(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def write_hotpot(path, example_id, *, context):
+        path.write_text(
+            json.dumps(
+                [
+                    {
+                        "_id": example_id,
+                        "question": "What is the answer?",
+                        "answer": "alpha",
+                        "context": context,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    train_path = tmp_path / "train.json"
+    selection_path = tmp_path / "selection.json"
+    confirmation_path = tmp_path / "confirmation.json"
+    write_hotpot(train_path, "train_1", context=[["Title", ["alpha is supported."]]])
+    write_hotpot(selection_path, "selection_1", context=[["Title", ["alpha is supported."]]])
+    write_hotpot(confirmation_path, "confirmation_1", context=[])
+
+    readiness = check_fixed_pool_split_readiness(
+        dataset="hotpotqa",
+        train_path=train_path,
+        selection_path=selection_path,
+        confirmation_path=confirmation_path,
+        require_context=True,
+    )
+
+    assert readiness.datasets["hotpotqa.train"]["ok"]
+    assert readiness.datasets["hotpotqa.selection"]["ok"]
+    assert not readiness.datasets["hotpotqa.confirmation"]["ok"]
+    assert any("confirmation data unavailable" in reason for reason in readiness.reasons)
+
+
+def test_fixed_pool_split_readiness_rejects_cross_split_overlap(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def write_hotpot(path, example_id):
+        path.write_text(
+            json.dumps(
+                [
+                    {
+                        "_id": example_id,
+                        "question": "What is the answer?",
+                        "answer": "alpha",
+                        "context": [["Title", ["alpha is supported."]]],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    train_path = tmp_path / "train.json"
+    selection_path = tmp_path / "selection.json"
+    confirmation_path = tmp_path / "confirmation.json"
+    write_hotpot(train_path, "shared_id")
+    write_hotpot(selection_path, "shared_id")
+    write_hotpot(confirmation_path, "confirmation_id")
+
+    readiness = check_fixed_pool_split_readiness(
+        dataset="hotpotqa",
+        train_path=train_path,
+        selection_path=selection_path,
+        confirmation_path=confirmation_path,
+        require_context=True,
+    )
+
+    assert readiness.datasets["hotpotqa.train"]["ok"]
+    assert readiness.datasets["hotpotqa.selection"]["ok"]
+    assert not readiness.ready
+    assert any("overlap between train and selection" in reason for reason in readiness.reasons)
+
+
+def test_cli_run_openai_fixed_pool_checks_all_split_readiness(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    for name, context in (
+        ("train", [["Title", ["alpha is supported."]]]),
+        ("selection", [["Title", ["alpha is supported."]]]),
+        ("confirmation", []),
+    ):
+        (tmp_path / f"{name}.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "_id": name,
+                        "question": "What is the answer?",
+                        "answer": "alpha",
+                        "context": context,
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    exit_code = cli_main(
+        [
+            "run-openai-fixed-pool",
+            "--dataset",
+            "hotpotqa",
+            "--train",
+            str(tmp_path / "train.json"),
+            "--selection",
+            str(tmp_path / "selection.json"),
+            "--confirmation",
+            str(tmp_path / "confirmation.json"),
+        ]
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert output["datasets"]["hotpotqa.selection"]["ok"] is True
+    assert output["datasets"]["hotpotqa.confirmation"]["ok"] is False
+    assert any("confirmation data unavailable" in reason for reason in output["reasons"])
 
 
 def test_cli_run_openai_fixed_pool_fails_readiness_without_key(tmp_path, monkeypatch, capsys):
@@ -897,6 +1729,219 @@ def test_cli_run_openai_fixed_pool_fails_readiness_without_key(tmp_path, monkeyp
     assert "OPENAI_API_KEY is not set" in output["reasons"]
 
 
+def test_cli_run_openai_fixed_pool_requires_model_prices(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    for name in ("train", "selection", "confirmation"):
+        (tmp_path / f"{name}.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "_id": name,
+                        "question": "What is the answer?",
+                        "answer": "alpha",
+                        "context": [["Title", ["alpha is supported."]]],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    exit_code = cli_main(
+        [
+            "run-openai-fixed-pool",
+            "--config",
+            "configs/mvp_hotpotqa_gpt41mini.yaml",
+            "--dataset",
+            "hotpotqa",
+            "--train",
+            str(tmp_path / "train.json"),
+            "--selection",
+            str(tmp_path / "selection.json"),
+            "--confirmation",
+            str(tmp_path / "confirmation.json"),
+        ]
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert output["accounting"]["ok"] is False
+    assert any("missing pricing table" in reason for reason in output["reasons"])
+
+
+def test_cli_run_openai_fixed_pool_requires_tiktoken_costing(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    config_path = tmp_path / "no_tiktoken.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "fixed_pool": {
+                    "task": "HotpotQA",
+                    "target_model": "gpt-4.1-mini",
+                    "n_trace_schemas": 1,
+                    "n_random_schemas": 0,
+                    "top_k_confirmation": 1,
+                    "bootstrap_resamples": 10,
+                    "randomization_swaps": 10,
+                    "use_tiktoken_costing": False,
+                },
+                "train_examples": 1,
+                "selection_examples": 1,
+                "confirmation_examples": 1,
+                "proposer": {"kind": "heuristic"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    for name in ("train", "selection", "confirmation"):
+        (tmp_path / f"{name}.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "_id": name,
+                        "question": "What is the answer?",
+                        "answer": "alpha",
+                        "context": [["Title", ["alpha is supported."]]],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    exit_code = cli_main(
+        [
+            "run-openai-fixed-pool",
+            "--config",
+            str(config_path),
+            "--dataset",
+            "hotpotqa",
+            "--train",
+            str(tmp_path / "train.json"),
+            "--selection",
+            str(tmp_path / "selection.json"),
+            "--confirmation",
+            str(tmp_path / "confirmation.json"),
+            "--input-price-per-million",
+            "1.0",
+            "--output-price-per-million",
+            "2.0",
+        ]
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert output["accounting"]["ok"] is False
+    assert any("tiktoken costing" in reason for reason in output["reasons"])
+    assert not any("missing pricing table" in reason for reason in output["reasons"])
+
+
+def test_causal_pilot_and_deployment_reports_write_artifacts(tmp_path):
+    result = run_fixed_pool_schema_mvp(
+        base_program=build_toy_program(),
+        train_traces=make_toy_traces(),
+        smoke_examples=(),
+        selection_examples=make_toy_examples("validation_selection", 3),
+        confirmation_examples=make_toy_examples("validation_confirmation", 3),
+        scorer=toy_scorer,
+        config=FixedPoolConfig(
+            task="toy_multihop",
+            target_model="toy-model",
+            seed=61,
+            n_trace_schemas=1,
+            n_random_schemas=0,
+            top_k_confirmation=1,
+            bootstrap_resamples=10,
+            randomization_swaps=10,
+            progress="none",
+        ),
+        artifact_dir=tmp_path / "run",
+    )
+
+    causal = build_causal_pilot_report(
+        result=result,
+        dataset="toy",
+        model="toy-model",
+        artifact_dir=tmp_path / "reports",
+    )
+    deployment = build_fixed_pool_deployment_report(
+        result=result,
+        artifact_dir=tmp_path / "reports",
+    )
+
+    assert causal.proceed
+    assert causal.max_shuffle_drop > 0.0
+    assert deployment.serving_invariant
+    assert Path(causal.artifacts["summary"]).exists()
+    assert Path(deployment.artifacts["summary"]).exists()
+
+
+def test_budget_pareto_report_aggregates_summary_files(tmp_path):
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text(
+        json.dumps(
+            {
+                "primary_confirmation_mean": 0.6,
+                "cost_summary": {
+                    "target_task_calls": 10,
+                    "retriever_calls": 5,
+                    "prompt_tokens": 100,
+                    "completion_tokens": 50,
+                    "total_tokens": 150,
+                    "dollar_cost": 0.10,
+                    "max_p95_latency_ms": 12,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    second.write_text(
+        json.dumps(
+            {
+                "primary_confirmation_mean": 0.7,
+                "cost_summary": {
+                    "target_task_calls": 10,
+                    "retriever_calls": 5,
+                    "prompt_tokens": 120,
+                    "completion_tokens": 60,
+                    "total_tokens": 180,
+                    "dollar_cost": 0.12,
+                    "max_p95_latency_ms": 14,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_budget_pareto_report(
+        run_paths={"first": first, "second": second},
+        artifact_dir=tmp_path / "pareto",
+    )
+
+    assert {row.method for row in report.rows} == {"first", "second"}
+    assert "second" in report.pareto_methods
+    assert Path(report.artifacts["csv"]).exists()
+
+
+def test_external_prompt_optimizer_applies_prompt_patch(tmp_path):
+    script = (
+        "import json, os; "
+        "data=json.load(open(os.environ['SCHEMAEVO_INPUT_PROGRAM'])); "
+        "data['modules'][0]['prompt'] += '\\nPatched externally.'; "
+        "json.dump(data, open(os.environ['SCHEMAEVO_OUTPUT_PROGRAM'], 'w'))"
+    )
+    optimizer = ExternalPromptOptimizer(
+        name="test_prompt_optimizer",
+        command=f"{sys.executable} -c \"{script}\"",
+        artifact_dir=tmp_path,
+    )
+
+    optimized = optimizer(build_toy_program())
+
+    assert "Patched externally." in optimized.modules[0].prompt
+    assert (tmp_path / "test_prompt_optimizer_input_program.json").exists()
+    assert (tmp_path / "test_prompt_optimizer_output_program.json").exists()
+
+
 def test_composability_harness_runs_external_prompt_optimizer_then_schemaevo(tmp_path):
     def prompt_optimizer(program):
         optimized = program.clone()
@@ -922,6 +1967,12 @@ def test_composability_harness_runs_external_prompt_optimizer_then_schemaevo(tmp
     )
 
     assert result.prompt_delta == pytest.approx(0.0)
+    assert result.schemaevo_additive_delta == pytest.approx(1.0)
+    assert result.schemaevo_eval_results
+    assert result.best_schemaevo_eval_result is not None
+    assert result.summary()["same_eval_examples"] is True
+    assert result.summary()["paired_stats"]["schemaevo_vs_prompt"]["bootstrap"]["ci_low"] >= 1.0
+    assert result.budget_summary["evaluation"]["target_task_calls"] > 0
     assert result.schemaevo_result.final_records
     assert (tmp_path / "composability_summary.json").exists()
 

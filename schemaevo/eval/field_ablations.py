@@ -4,9 +4,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from schemaevo.eval.cost_ledger import CostMeter
+from schemaevo.eval.budgeting import estimate_evaluation_budget
+from schemaevo.eval.cost_ledger import BudgetTracker, CostMeter
 from schemaevo.eval.scoring import CandidateEvalResult, Scorer, evaluate_program
 from schemaevo.programs.base import FieldIntervention, LMProgram, ProgramExample
+from schemaevo.utils.progress import ProgressMode, progress_iter
 
 
 @dataclass(frozen=True)
@@ -17,6 +19,13 @@ class FieldAblationResult:
     drop_vs_unablated: float
     invalid_output_rate: float
     per_example_scores: tuple[float, ...]
+    target_task_calls: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    dollar_cost: float = 0.0
+    wall_clock_seconds: float = 0.0
+    p50_latency_ms: float = 0.0
+    p95_latency_ms: float = 0.0
 
 
 class MaskFieldsIntervention:
@@ -107,11 +116,18 @@ def run_field_use_ablations(
     seed: int,
     artifact_dir: str | Path | None = None,
     cost_meter: CostMeter | None = None,
+    budget: BudgetTracker | None = None,
+    progress: ProgressMode = "auto",
 ) -> list[FieldAblationResult]:
     results: list[FieldAblationResult] = []
     consumer_modules = _consumer_modules(program)
     shuffled_values = _rotated_field_values_by_example(unablated_result, fields)
-    for field_name in fields:
+    for field_name in progress_iter(
+        fields,
+        total=len(fields),
+        description="field ablations",
+        mode=progress,
+    ):
         for ablation, intervention in (
             ("mask", MaskFieldsIntervention((field_name,), consumer_modules=consumer_modules)),
             ("blank", BlankFieldsIntervention((field_name,), consumer_modules=consumer_modules)),
@@ -123,6 +139,13 @@ def run_field_use_ablations(
                 ),
             ),
         ):
+            if budget is not None and not _can_start_ablation(
+                budget=budget,
+                program=program,
+                examples=examples,
+                cost_meter=cost_meter,
+            ):
+                return results
             result = _eval_intervention(
                 program=program,
                 examples=examples,
@@ -134,6 +157,8 @@ def run_field_use_ablations(
                 method=f"field_{ablation}",
                 field_name=field_name,
             )
+            if budget is not None:
+                budget.record_result(result)
             results.append(
                 FieldAblationResult(
                     ablation=ablation,
@@ -142,9 +167,23 @@ def run_field_use_ablations(
                     drop_vs_unablated=unablated_result.mean_score - result.mean_score,
                     invalid_output_rate=result.invalid_output_rate,
                     per_example_scores=result.per_example_scores,
+                    target_task_calls=result.target_task_calls,
+                    prompt_tokens=result.prompt_tokens,
+                    completion_tokens=result.completion_tokens,
+                    dollar_cost=result.dollar_cost,
+                    wall_clock_seconds=result.wall_clock_seconds,
+                    p50_latency_ms=result.p50_latency_ms,
+                    p95_latency_ms=result.p95_latency_ms,
                 )
             )
     if fields:
+        if budget is not None and not _can_start_ablation(
+            budget=budget,
+            program=program,
+            examples=examples,
+            cost_meter=cost_meter,
+        ):
+            return results
         result = _eval_intervention(
             program=program,
             examples=examples,
@@ -156,6 +195,8 @@ def run_field_use_ablations(
             method="field_downstream_disabled",
             field_name="__all__",
         )
+        if budget is not None:
+            budget.record_result(result)
         results.append(
             FieldAblationResult(
                 ablation="downstream_disabled",
@@ -164,9 +205,36 @@ def run_field_use_ablations(
                 drop_vs_unablated=unablated_result.mean_score - result.mean_score,
                 invalid_output_rate=result.invalid_output_rate,
                 per_example_scores=result.per_example_scores,
+                target_task_calls=result.target_task_calls,
+                prompt_tokens=result.prompt_tokens,
+                completion_tokens=result.completion_tokens,
+                dollar_cost=result.dollar_cost,
+                wall_clock_seconds=result.wall_clock_seconds,
+                p50_latency_ms=result.p50_latency_ms,
+                p95_latency_ms=result.p95_latency_ms,
             )
         )
     return results
+
+
+def _can_start_ablation(
+    *,
+    budget: BudgetTracker,
+    program: LMProgram,
+    examples: tuple[ProgramExample, ...],
+    cost_meter: CostMeter | None = None,
+) -> bool:
+    estimate = estimate_evaluation_budget(
+        program=program,
+        examples=examples,
+        cost_meter=cost_meter or CostMeter(),
+    )
+    return (not budget.exhausted) and budget.can_start(
+        min_target_task_calls=estimate.target_task_calls,
+        min_prompt_tokens=estimate.prompt_tokens,
+        min_completion_tokens=estimate.completion_tokens,
+        min_dollar_cost=estimate.dollar_cost,
+    )
 
 
 def _eval_intervention(

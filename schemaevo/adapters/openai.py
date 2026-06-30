@@ -65,25 +65,26 @@ def _module_spec_from_config(config: OpenAIModuleConfig, *, client: Any | None) 
         prompt=config.prompt,
         model=config.model,
         max_output_tokens=config.max_output_tokens,
-        runner=_make_runner(client),
+        runner=OpenAIResponsesRunner(client=client),
         llm_calls=config.llm_calls,
         retriever_calls=config.retriever_calls,
         metadata=metadata,
     )
 
 
-def _make_runner(client: Any | None):
-    api_client = client
+class OpenAIResponsesRunner:
+    def __init__(self, client: Any | None = None) -> None:
+        self.api_client = client
 
-    def run(
+    def __call__(
+        self,
         state: dict[str, Any],
         spec: ModuleSpec,
         example: ProgramExample,
         context: ModuleExecutionContext,
     ) -> dict[str, Any]:
-        nonlocal api_client
-        if api_client is None:
-            api_client = _make_openai_client()
+        if self.api_client is None:
+            self.api_client = _make_openai_client()
         module_input = _build_module_input(state=state, spec=spec, example=example)
         create_kwargs: dict[str, Any] = {
             "model": spec.model,
@@ -123,10 +124,8 @@ def _make_runner(client: Any | None):
         temperature = spec.metadata.get("temperature")
         if temperature is not None:
             create_kwargs["temperature"] = float(temperature)
-        response = api_client.responses.create(**create_kwargs)
+        response = self.api_client.responses.create(**create_kwargs)
         return _extract_response_json(response)
-
-    return run
 
 
 def _make_openai_client() -> Any:
@@ -172,7 +171,10 @@ def _module_output_json_schema(spec: ModuleSpec) -> dict[str, Any]:
             else configured_types.get(field_name, "string")
         )
         required_field = bool(schema_field.get("required", True)) if schema_field else True
-        field_schema = _json_schema_for_field_type(str(field_type), schema_field)
+        field_schema = _json_schema_for_field_type(
+            str(field_type),
+            schema_field or {"name": field_name},
+        )
         if not required_field:
             field_schema = _nullable_schema(field_schema)
         properties[field_name] = field_schema
@@ -195,12 +197,84 @@ def _json_schema_for_field_type(field_type: str, schema_field: dict[str, Any] | 
     if field_type == "array[string]":
         return {"type": "array", "items": {"type": "string"}}
     if field_type == "array[object]":
-        return {"type": "array", "items": {"type": "object", "additionalProperties": True}}
+        return {
+            "type": "array",
+            "items": _array_object_item_schema(schema_field),
+        }
     if field_type == "object":
-        return {"type": "object", "additionalProperties": True}
+        return _object_schema_for_field(schema_field)
     if field_type == "enum" and schema_field and schema_field.get("enum_values"):
         return {"type": "string", "enum": list(schema_field["enum_values"])}
     return {"type": "string"}
+
+
+def _array_object_item_schema(schema_field: dict[str, Any] | None) -> dict[str, Any]:
+    field_name = str(schema_field.get("name", "")) if schema_field else ""
+    properties = _known_object_properties(field_name) or {
+        "value": {"type": "string"},
+    }
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+def _object_schema_for_field(schema_field: dict[str, Any] | None) -> dict[str, Any]:
+    field_name = str(schema_field.get("name", "")) if schema_field else ""
+    properties = _known_object_properties(field_name) or {
+        "value": {"type": "string"},
+    }
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+def _known_object_properties(field_name: str) -> dict[str, Any]:
+    if field_name == "claim_atoms":
+        return {
+            "text": {"type": "string"},
+            "entities": {"type": "array", "items": {"type": "string"}},
+            "relation": {"type": "string"},
+            "needs_evidence_from": {"type": "string"},
+        }
+    if field_name == "hop_plan":
+        return {
+            "hop_index": {"type": "integer"},
+            "query_intent": {"type": "string"},
+            "anchor_entity": {"type": "string"},
+            "missing_evidence_reason": {"type": "string"},
+        }
+    if field_name == "evidence_table":
+        return {
+            "title": {"type": "string"},
+            "sentence": {"type": "string"},
+            "supports_atom_ids": {"type": "array", "items": {"type": "integer"}},
+            "contradicts_atom_ids": {"type": "array", "items": {"type": "integer"}},
+            "confidence": {"type": "number"},
+        }
+    if field_name == "evidence_conflict":
+        return {
+            "has_conflict": {"type": "boolean"},
+            "conflict_description": {"type": "string"},
+        }
+    if field_name == "bridge_entities":
+        return {
+            "surface": {"type": "string"},
+            "role": {"type": "string"},
+            "confidence": {"type": "number"},
+        }
+    if field_name == "evidence_needs":
+        return {
+            "needed_fact": {"type": "string"},
+            "source_hint": {"type": "string"},
+            "resolved": {"type": "boolean"},
+        }
+    return {}
 
 
 def _nullable_schema(schema: dict[str, Any]) -> dict[str, Any]:

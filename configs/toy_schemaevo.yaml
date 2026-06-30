@@ -15,6 +15,14 @@ fixed_pool:
   strict_invalid_policy: true
   reflection_rounds: 1
   reflection_schemas_per_round: 0
+  use_tiktoken_costing: false
+  max_target_task_calls: null
+  max_prompt_tokens: null
+  max_completion_tokens: null
+  max_total_tokens: null
+  max_dollar_cost: null
+  workers: 1
+  progress: auto
 smoke_examples: 4
 selection_examples: 12
 confirmation_examples: 20
@@ -43,4 +51,5 @@ closed_loop:
   parent_ucb_exploration: 0.25
   operator_ucb_exploration: 0.4
   use_tiktoken_costing: false
+  progress: auto
 closed_loop_examples: 24

@@ -59,7 +59,9 @@ class CandidateEvalResult:
     def to_dict(self, include_predictions: bool = False) -> dict[str, object]:
         data = asdict(self)
         data["predictions"] = (
-            [prediction.final_output for prediction in self.predictions] if include_predictions else []
+            [_prediction_summary(prediction) for prediction in self.predictions]
+            if include_predictions
+            else []
         )
         return data
 
@@ -138,16 +140,10 @@ def evaluate_program(
             for example, score, prediction in zip(examples, scores, predictions):
                 handle.write(
                     json.dumps(
-                        {
-                            "example_id": example.example_id,
-                            "score": score,
-                            "valid": prediction.valid,
-                            "schema_id": prediction.schema_id,
-                            "candidate_id": prediction.candidate_id,
-                            "validation_errors": list(prediction.validation_errors),
-                        },
+                        _score_row(example=example, score=score, prediction=prediction),
                         sort_keys=True,
                         ensure_ascii=True,
+                        default=str,
                     )
                     + "\n"
                 )
@@ -232,6 +228,44 @@ def evaluate_candidates(
             )
         )
     return results
+
+
+def _prediction_summary(prediction: ProgramPrediction) -> dict[str, object]:
+    return {
+        "run_id": prediction.run_id,
+        "example_id": prediction.example_id,
+        "candidate_id": prediction.candidate_id,
+        "schema_id": prediction.schema_id,
+        "final_output": prediction.final_output,
+        "valid": prediction.valid,
+        "validation_errors": list(prediction.validation_errors),
+        "target_task_calls": prediction.target_task_calls,
+        "retriever_calls": prediction.retriever_calls,
+        "prompt_tokens": prediction.prompt_tokens,
+        "completion_tokens": prediction.completion_tokens,
+        "dollar_cost": prediction.dollar_cost,
+        "latency_ms": prediction.latency_ms,
+    }
+
+
+def _score_row(
+    *,
+    example: ProgramExample,
+    score: float,
+    prediction: ProgramPrediction,
+) -> dict[str, object]:
+    row = _prediction_summary(prediction)
+    row.update(
+        {
+            "task_split": example.split,
+            "score": score,
+            "schema_validation_repair_calls": sum(
+                getattr(log, "llm_repair_call_count", 0) for log in prediction.module_logs
+            ),
+            "field_use_events": [asdict(event) for event in prediction.field_use_events],
+        }
+    )
+    return row
 
 
 def _single_split(examples: tuple[ProgramExample, ...]) -> str:

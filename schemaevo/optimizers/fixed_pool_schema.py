@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from schemaevo.eval.budgeting import EvaluationBudgetEstimate, estimate_evaluation_budget
 from schemaevo.eval.cache import RolloutCache
-from schemaevo.eval.cost_ledger import CostMeter, make_cost_meter
+from schemaevo.eval.cost_ledger import BudgetLimits, BudgetTracker, CostMeter, make_cost_meter
 from schemaevo.eval.field_ablations import FieldAblationResult, run_field_use_ablations
 from schemaevo.eval.scoring import CandidateEvalResult, Scorer, evaluate_program
 from schemaevo.eval.stats import PairedComparison, benjamini_hochberg_adjust, compare_paired
@@ -19,6 +21,7 @@ from schemaevo.schemas.human_templates import make_human_minimal_schemas, make_v
 from schemaevo.schemas.proposer import SchemaProposer, TraceExample, propose_schemas_from_traces
 from schemaevo.schemas.random_controls import make_random_schema_controls
 from schemaevo.schemas.serialization import freeze_jsonl, write_json
+from schemaevo.utils.progress import ProgressMode, progress_iter
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,13 @@ class FixedPoolConfig:
     reflection_schemas_per_round: int = 0
     use_tiktoken_costing: bool = False
     model_prices: dict[str, dict[str, float | str]] = field(default_factory=dict)
+    max_target_task_calls: int | None = None
+    max_prompt_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    max_total_tokens: int | None = None
+    max_dollar_cost: float | None = None
+    workers: int = 1
+    progress: ProgressMode = "auto"
 
     def __post_init__(self) -> None:
         if self.n_trace_schemas < 0:
@@ -64,6 +74,21 @@ class FixedPoolConfig:
             raise ValueError("reflection_rounds must be positive")
         if self.reflection_schemas_per_round < 0:
             raise ValueError("reflection_schemas_per_round must be non-negative")
+        for name in (
+            "max_target_task_calls",
+            "max_prompt_tokens",
+            "max_completion_tokens",
+            "max_total_tokens",
+        ):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.max_dollar_cost is not None and self.max_dollar_cost < 0:
+            raise ValueError("max_dollar_cost must be non-negative")
+        if self.workers <= 0:
+            raise ValueError("workers must be positive")
+        if self.progress not in {"auto", "rich", "tqdm", "none"}:
+            raise ValueError("progress must be one of: auto, rich, tqdm, none")
 
 
 @dataclass(frozen=True)
@@ -92,6 +117,9 @@ class FixedPoolResult:
     heldout_test_stats: PairedComparison | None
     field_ablation_results: tuple[FieldAblationResult, ...]
     decision: MVPDecision
+    cost_summary: dict[str, float | int]
+    budget_summary: dict[str, float | int | bool | None]
+    proposal_usage: dict[str, float | int]
     reflection_rounds: tuple[dict[str, Any], ...]
     artifacts: dict[str, str]
 
@@ -107,6 +135,9 @@ class FixedPoolResult:
             "score_delta": self.decision.score_delta,
             "invalid_output_rate": self.best_confirmation_result.invalid_output_rate,
             "field_ablations": [asdict(result) for result in self.field_ablation_results],
+            "cost_summary": self.cost_summary,
+            "budget": self.budget_summary,
+            "proposal_usage": self.proposal_usage,
             "reflection_rounds": self.reflection_rounds,
             "artifacts": self.artifacts,
         }
@@ -133,6 +164,7 @@ def run_fixed_pool_schema_mvp(
         model_prices=config.model_prices,
         use_tiktoken=config.use_tiktoken_costing,
     )
+    budget = _make_budget_tracker(config)
     _validate_examples_and_splits(
         train_traces=train_traces,
         smoke_examples=smoke_examples,
@@ -146,6 +178,7 @@ def run_fixed_pool_schema_mvp(
         allowed_modules=module_names,
         max_schema_tokens=config.schema_token_budget,
     )
+    _reset_proposal_usage(proposer)
     schema_pool = _build_schema_pool(
         traces=train_traces,
         task=config.task,
@@ -153,6 +186,8 @@ def run_fixed_pool_schema_mvp(
         config=config,
         proposer=proposer,
     )
+    recorded_proposal_usage = _proposal_usage_from_proposer(proposer)
+    _record_proposal_usage(budget, recorded_proposal_usage)
     schema_pool = tuple(_static_filter(schema_pool, grammar))
     if not schema_pool:
         raise RuntimeError("schema pool is empty after static checks")
@@ -163,20 +198,24 @@ def run_fixed_pool_schema_mvp(
     compiled_candidates = tuple(
         _compile_candidate(base_program=base_program, schema=schema, config=config) for schema in schema_pool
     )
+    confirmation_pair_calls = len(confirmation_examples) * base_program.calls_per_example * 2
+    selection_min_calls = len(selection_examples) * base_program.calls_per_example
 
-    baseline_selection = evaluate_program(
+    baseline_selection = _evaluate_required_with_budget(
+        budget=budget,
         program=base_program,
         examples=selection_examples,
         scorer=scorer,
+        config=config,
         method="fixed_schema_reference",
         candidate_id="fixed_schema_reference_selection",
-        seed=config.seed,
         baseline_program=base_program,
-        strict_invalid_policy=config.strict_invalid_policy,
         artifact_dir=artifact_root,
         cost_meter=cost_meter,
         rollout_cache=rollout_cache,
         run_id="fixed_schema_reference_selection",
+        stage="selection baseline",
+        reserve_target_task_calls=confirmation_pair_calls + selection_min_calls,
     )
     smoke_results = (
         tuple(
@@ -191,6 +230,8 @@ def run_fixed_pool_schema_mvp(
                 baseline_cost=baseline_selection.dollar_cost_per_example,
                 cost_meter=cost_meter,
                 rollout_cache=rollout_cache,
+                budget=budget,
+                reserve_target_task_calls=selection_min_calls + confirmation_pair_calls,
             )
         )
         if smoke_examples
@@ -222,6 +263,8 @@ def run_fixed_pool_schema_mvp(
             baseline_cost=baseline_selection.dollar_cost_per_example,
             cost_meter=cost_meter,
             rollout_cache=rollout_cache,
+            budget=budget,
+            reserve_target_task_calls=confirmation_pair_calls,
         )
     )
     reflection_rounds: tuple[dict[str, Any], ...] = ()
@@ -238,7 +281,8 @@ def run_fixed_pool_schema_mvp(
             compiled_candidates=compiled_candidates,
             smoke_results=smoke_results,
             selection_results=selection_results,
-            train_like_examples=selection_examples,
+            train_traces=train_traces,
+            selection_examples=selection_examples,
             smoke_examples=smoke_examples,
             scorer=scorer,
             config=config,
@@ -249,9 +293,25 @@ def run_fixed_pool_schema_mvp(
             baseline_cost=baseline_selection.dollar_cost_per_example,
             cost_meter=cost_meter,
             rollout_cache=rollout_cache,
+            budget=budget,
+            reserve_target_task_calls=confirmation_pair_calls,
         )
         if artifact_root:
             schema_pool_path = str(freeze_jsonl(schema_pool, artifact_root / "schemas" / "frozen_pool.jsonl"))
+    proposal_usage = _proposal_usage_from_proposer(proposer)
+    reflection_usage = _proposal_usage_delta(
+        previous=recorded_proposal_usage,
+        current=proposal_usage,
+    )
+    proposal_usage = {
+        **proposal_usage,
+        "optimizer_reflection_calls": int(reflection_usage.get("optimizer_proposal_calls", 0)),
+    }
+    _record_proposal_usage_delta(
+        budget=budget,
+        previous=recorded_proposal_usage,
+        current=proposal_usage,
+    )
     top_selection_results = tuple(
         select_top_k_by_lcb(
             list(selection_results),
@@ -260,26 +320,36 @@ def run_fixed_pool_schema_mvp(
         )
     )
     primary_schema_id = top_selection_results[0].schema_id if top_selection_results else ""
-    top_schema_ids = {result.schema_id for result in top_selection_results}
-    top_programs = tuple(
-        candidate
+    programs_by_schema_id = {
+        candidate.schema_candidate.schema_id: candidate
         for candidate in compiled_candidates
-        if candidate.schema_candidate and candidate.schema_candidate.schema_id in top_schema_ids
+        if candidate.schema_candidate
+    }
+    top_programs = tuple(
+        programs_by_schema_id[result.schema_id]
+        for result in top_selection_results
+        if result.schema_id in programs_by_schema_id
     )
+    if not top_programs:
+        raise RuntimeError("no schema candidates survived budgeted selection")
+    primary_program = top_programs[0]
+    primary_confirmation_min_calls = len(confirmation_examples) * primary_program.calls_per_example
 
-    baseline_confirmation = evaluate_program(
+    baseline_confirmation = _evaluate_required_with_budget(
+        budget=budget,
         program=base_program,
         examples=confirmation_examples,
         scorer=scorer,
+        config=config,
         method="fixed_schema_reference",
         candidate_id="fixed_schema_reference_confirmation",
-        seed=config.seed,
         baseline_program=base_program,
-        strict_invalid_policy=config.strict_invalid_policy,
         artifact_dir=artifact_root,
         cost_meter=cost_meter,
         rollout_cache=rollout_cache,
         run_id="fixed_schema_reference_confirmation",
+        stage="confirmation baseline",
+        reserve_target_task_calls=primary_confirmation_min_calls,
     )
     confirmation_results = tuple(
         _evaluate_many(
@@ -293,6 +363,7 @@ def run_fixed_pool_schema_mvp(
             baseline_cost=baseline_confirmation.dollar_cost_per_example,
             cost_meter=cost_meter,
             rollout_cache=rollout_cache,
+            budget=budget,
         )
     )
     if not confirmation_results:
@@ -303,11 +374,6 @@ def run_fixed_pool_schema_mvp(
     best_confirmation = max(
         confirmation_results,
         key=lambda result: (result.mean_score, -result.invalid_output_rate, result.schema_id),
-    )
-    primary_program = next(
-        candidate
-        for candidate in top_programs
-        if candidate.schema_candidate and candidate.schema_candidate.schema_id == primary_confirmation.schema_id
     )
     paired_stats = compare_paired(
         baseline_confirmation.per_example_scores,
@@ -323,40 +389,65 @@ def run_fixed_pool_schema_mvp(
     )
     paired_stats = corrected_confirmation_stats.get(primary_confirmation.schema_id, paired_stats)
     heldout_test_result: CandidateEvalResult | None = None
+    heldout_baseline_result: CandidateEvalResult | None = None
     heldout_test_stats: PairedComparison | None = None
-    if heldout_test_examples:
-        heldout_baseline = evaluate_program(
+    heldout_pair_calls = (
+        len(heldout_test_examples) * base_program.calls_per_example
+        + len(heldout_test_examples) * primary_program.calls_per_example
+    )
+    heldout_pair_estimate = estimate_evaluation_budget(
+        program=base_program,
+        examples=heldout_test_examples,
+        cost_meter=cost_meter,
+    ).plus(
+        estimate_evaluation_budget(
+            program=primary_program,
+            examples=heldout_test_examples,
+            cost_meter=cost_meter,
+        )
+    )
+    if heldout_test_examples and _can_start_budget(
+        budget,
+        min_target_task_calls=heldout_pair_calls,
+        min_prompt_tokens=heldout_pair_estimate.prompt_tokens,
+        min_completion_tokens=heldout_pair_estimate.completion_tokens,
+        min_dollar_cost=heldout_pair_estimate.dollar_cost,
+    ):
+        heldout_baseline_result = _evaluate_required_with_budget(
+            budget=budget,
             program=base_program,
             examples=heldout_test_examples,
             scorer=scorer,
+            config=config,
             method="fixed_schema_reference",
             candidate_id="fixed_schema_reference_heldout_test",
-            seed=config.seed,
             baseline_program=base_program,
-            strict_invalid_policy=config.strict_invalid_policy,
             artifact_dir=artifact_root,
             cost_meter=cost_meter,
             rollout_cache=rollout_cache,
             run_id="fixed_schema_reference_heldout_test",
+            stage="heldout baseline",
+            reserve_target_task_calls=len(heldout_test_examples) * primary_program.calls_per_example,
         )
-        heldout_test_result = evaluate_program(
+        heldout_test_result = _evaluate_required_with_budget(
+            budget=budget,
             program=primary_program,
             examples=heldout_test_examples,
             scorer=scorer,
+            config=config,
             method="schema_heldout_test",
             candidate_id=f"schema_heldout_test_{primary_confirmation.schema_id}",
-            seed=config.seed,
             baseline_program=base_program,
-            strict_invalid_policy=config.strict_invalid_policy,
             artifact_dir=artifact_root,
             cost_meter=cost_meter,
             rollout_cache=rollout_cache,
             schema_generation_calls=0,
             run_id=f"schema_heldout_test_{primary_confirmation.schema_id}",
+            stage="heldout primary",
         )
-        heldout_test_result.baseline_dollar_cost_per_example = heldout_baseline.dollar_cost_per_example
+        heldout_test_result.baseline_dollar_cost_per_example = heldout_baseline_result.dollar_cost_per_example
         heldout_test_stats = compare_paired(
-            heldout_baseline.per_example_scores,
+            heldout_baseline_result.per_example_scores,
             heldout_test_result.per_example_scores,
             n_resamples=config.bootstrap_resamples,
             n_swaps=config.randomization_swaps,
@@ -372,6 +463,8 @@ def run_fixed_pool_schema_mvp(
             seed=config.seed,
             artifact_dir=artifact_root,
             cost_meter=cost_meter,
+            budget=budget,
+            progress=config.progress,
         )
     )
     decision = _make_decision(
@@ -381,6 +474,20 @@ def run_fixed_pool_schema_mvp(
         field_ablation_results=field_ablation_results,
         config=config,
     )
+    cost_summary = _cost_summary(
+        eval_results=(
+            baseline_selection,
+            *smoke_results,
+            *selection_results,
+            baseline_confirmation,
+            *confirmation_results,
+            *((heldout_baseline_result,) if heldout_baseline_result else ()),
+            *((heldout_test_result,) if heldout_test_result else ()),
+        ),
+        field_ablation_results=field_ablation_results,
+        proposal_usage=proposal_usage,
+    )
+    budget_summary = budget.summary()
     artifacts = {"schema_pool": schema_pool_path}
     if artifact_root:
         summary_path = write_json(
@@ -412,6 +519,9 @@ def run_fixed_pool_schema_mvp(
                 if heldout_test_stats
                 else None,
                 "field_ablation_results": [asdict(result) for result in field_ablation_results],
+                "cost_summary": cost_summary,
+                "budget": budget_summary,
+                "proposal_usage": proposal_usage,
                 "reflection_rounds": list(reflection_rounds),
             },
             artifact_root / "results" / "mvp_summary.json",
@@ -434,6 +544,9 @@ def run_fixed_pool_schema_mvp(
         heldout_test_stats=heldout_test_stats,
         field_ablation_results=field_ablation_results,
         decision=decision,
+        cost_summary=cost_summary,
+        budget_summary=budget_summary,
+        proposal_usage=proposal_usage,
         reflection_rounds=reflection_rounds,
         artifacts=artifacts,
     )
@@ -541,6 +654,19 @@ def _compile_candidate(
     return candidate
 
 
+@dataclass(frozen=True)
+class _CandidateEvalJob:
+    candidate: LMProgram
+    examples: tuple[ProgramExample, ...]
+    scorer: Scorer
+    config: FixedPoolConfig
+    base_program: LMProgram
+    artifact_root: Path | None
+    method: str
+    baseline_cost: float
+    index: int
+
+
 def _evaluate_many(
     *,
     candidates: tuple[LMProgram, ...],
@@ -553,28 +679,425 @@ def _evaluate_many(
     baseline_cost: float,
     cost_meter: CostMeter,
     rollout_cache: RolloutCache,
+    budget: BudgetTracker,
+    reserve_target_task_calls: int = 0,
 ) -> list[CandidateEvalResult]:
-    results: list[CandidateEvalResult] = []
-    for index, candidate in enumerate(candidates):
-        schema_id = candidate.schema_candidate.schema_id if candidate.schema_candidate else "original_schema"
-        result = evaluate_program(
-            program=candidate,
+    if budget.limits.enabled:
+        return _evaluate_many_budgeted_serial(
+            candidates=candidates,
             examples=examples,
             scorer=scorer,
+            config=config,
+            base_program=base_program,
+            artifact_root=artifact_root,
             method=method,
-            candidate_id=f"{method}_{index}",
-            seed=config.seed,
-            baseline_program=base_program,
-            strict_invalid_policy=config.strict_invalid_policy,
-            artifact_dir=artifact_root,
+            baseline_cost=baseline_cost,
             cost_meter=cost_meter,
             rollout_cache=rollout_cache,
-            schema_generation_calls=1,
-            run_id=f"{method}_{schema_id}_{index}",
+            budget=budget,
+            reserve_target_task_calls=reserve_target_task_calls,
         )
-        result.baseline_dollar_cost_per_example = baseline_cost
+    runnable = _candidate_jobs(
+        candidates=candidates,
+        examples=examples,
+        scorer=scorer,
+        config=config,
+        base_program=base_program,
+        artifact_root=artifact_root,
+        method=method,
+        baseline_cost=baseline_cost,
+    )
+    if not runnable:
+        return []
+    if config.workers > 1:
+        return _evaluate_many_parallel(
+            jobs=runnable,
+            budget=budget,
+            progress=config.progress,
+            workers=config.workers,
+            description=method,
+        )
+    return _evaluate_many_serial(
+        jobs=runnable,
+        cost_meter=cost_meter,
+        rollout_cache=rollout_cache,
+        budget=budget,
+        progress=config.progress,
+        description=method,
+    )
+
+
+def _candidate_jobs(
+    *,
+    candidates: tuple[LMProgram, ...],
+    examples: tuple[ProgramExample, ...],
+    scorer: Scorer,
+    config: FixedPoolConfig,
+    base_program: LMProgram,
+    artifact_root: Path | None,
+    method: str,
+    baseline_cost: float,
+) -> list[_CandidateEvalJob]:
+    jobs: list[_CandidateEvalJob] = []
+    for index, candidate in enumerate(candidates):
+        jobs.append(
+            _CandidateEvalJob(
+                candidate=candidate,
+                examples=examples,
+                scorer=scorer,
+                config=config,
+                base_program=base_program,
+                artifact_root=artifact_root,
+                method=method,
+                baseline_cost=baseline_cost,
+                index=index,
+            )
+        )
+    return jobs
+
+
+def _evaluate_many_budgeted_serial(
+    *,
+    candidates: tuple[LMProgram, ...],
+    examples: tuple[ProgramExample, ...],
+    scorer: Scorer,
+    config: FixedPoolConfig,
+    base_program: LMProgram,
+    artifact_root: Path | None,
+    method: str,
+    baseline_cost: float,
+    cost_meter: CostMeter,
+    rollout_cache: RolloutCache,
+    budget: BudgetTracker,
+    reserve_target_task_calls: int = 0,
+) -> list[CandidateEvalResult]:
+    results: list[CandidateEvalResult] = []
+    indexed_candidates = list(enumerate(candidates))
+    for index, candidate in progress_iter(
+        indexed_candidates,
+        total=len(indexed_candidates),
+        description=method,
+        mode=config.progress,
+    ):
+        min_calls = len(examples) * candidate.calls_per_example
+        estimate = estimate_evaluation_budget(
+            program=candidate,
+            examples=examples,
+            cost_meter=cost_meter,
+        )
+        if not _can_start_budget(
+            budget,
+            min_target_task_calls=min_calls,
+            min_prompt_tokens=estimate.prompt_tokens,
+            min_completion_tokens=estimate.completion_tokens,
+            min_dollar_cost=estimate.dollar_cost,
+            reserve_target_task_calls=reserve_target_task_calls,
+        ):
+            break
+        job = _CandidateEvalJob(
+            candidate=candidate,
+            examples=examples,
+            scorer=scorer,
+            config=config,
+            base_program=base_program,
+            artifact_root=artifact_root,
+            method=method,
+            baseline_cost=baseline_cost,
+            index=index,
+        )
+        result = _evaluate_candidate_job(
+            job,
+            cost_meter=cost_meter,
+            rollout_cache=rollout_cache,
+        )
+        budget.record_result(result)
         results.append(result)
     return results
+
+
+def _evaluate_many_serial(
+    *,
+    jobs: list[_CandidateEvalJob],
+    cost_meter: CostMeter,
+    rollout_cache: RolloutCache,
+    budget: BudgetTracker,
+    progress: ProgressMode,
+    description: str,
+) -> list[CandidateEvalResult]:
+    results: list[CandidateEvalResult] = []
+    for job in progress_iter(
+        jobs,
+        total=len(jobs),
+        description=description,
+        mode=progress,
+    ):
+        result = _evaluate_candidate_job(
+            job,
+            cost_meter=cost_meter,
+            rollout_cache=rollout_cache,
+        )
+        budget.record_result(result)
+        results.append(result)
+    return results
+
+
+def _evaluate_many_parallel(
+    *,
+    jobs: list[_CandidateEvalJob],
+    budget: BudgetTracker,
+    progress: ProgressMode,
+    workers: int,
+    description: str,
+) -> list[CandidateEvalResult]:
+    max_workers = min(workers, len(jobs))
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        mapped = executor.map(_evaluate_candidate_job_in_subprocess, jobs)
+        results = list(
+            progress_iter(
+                mapped,
+                total=len(jobs),
+                description=f"{description} [{max_workers} workers]",
+                mode=progress,
+            )
+        )
+    for result in results:
+        budget.record_result(result)
+    return results
+
+
+def _evaluate_candidate_job_in_subprocess(job: _CandidateEvalJob) -> CandidateEvalResult:
+    cost_meter = make_cost_meter(
+        model_prices=job.config.model_prices,
+        use_tiktoken=job.config.use_tiktoken_costing,
+    )
+    rollout_cache = RolloutCache(job.artifact_root / "rollout_cache" if job.artifact_root else None)
+    return _evaluate_candidate_job(job, cost_meter=cost_meter, rollout_cache=rollout_cache)
+
+
+def _evaluate_candidate_job(
+    job: _CandidateEvalJob,
+    *,
+    cost_meter: CostMeter,
+    rollout_cache: RolloutCache,
+) -> CandidateEvalResult:
+    candidate = job.candidate
+    schema_id = candidate.schema_candidate.schema_id if candidate.schema_candidate else "original_schema"
+    result = evaluate_program(
+        program=candidate,
+        examples=job.examples,
+        scorer=job.scorer,
+        method=job.method,
+        candidate_id=f"{job.method}_{job.index}",
+        seed=job.config.seed,
+        baseline_program=job.base_program,
+        strict_invalid_policy=job.config.strict_invalid_policy,
+        artifact_dir=job.artifact_root,
+        cost_meter=cost_meter,
+        rollout_cache=rollout_cache,
+        schema_generation_calls=1,
+        run_id=f"{job.method}_{schema_id}_{job.index}",
+    )
+    result.baseline_dollar_cost_per_example = job.baseline_cost
+    return result
+
+
+def _evaluate_required_with_budget(
+    *,
+    budget: BudgetTracker,
+    program: LMProgram,
+    examples: tuple[ProgramExample, ...],
+    scorer: Scorer,
+    config: FixedPoolConfig,
+    method: str,
+    candidate_id: str,
+    baseline_program: LMProgram,
+    artifact_dir: Path | None,
+    cost_meter: CostMeter,
+    rollout_cache: RolloutCache,
+    run_id: str,
+    stage: str,
+    reserve_target_task_calls: int = 0,
+    schema_generation_calls: int = 0,
+) -> CandidateEvalResult:
+    min_calls = len(examples) * program.calls_per_example
+    estimate = estimate_evaluation_budget(
+        program=program,
+        examples=examples,
+        cost_meter=cost_meter,
+    )
+    if not _can_start_budget(
+        budget,
+        min_target_task_calls=min_calls,
+        min_prompt_tokens=estimate.prompt_tokens,
+        min_completion_tokens=estimate.completion_tokens,
+        min_dollar_cost=estimate.dollar_cost,
+        reserve_target_task_calls=reserve_target_task_calls,
+    ):
+        raise RuntimeError(f"budget exhausted before {stage}: {budget.summary()}")
+    result = evaluate_program(
+        program=program,
+        examples=examples,
+        scorer=scorer,
+        method=method,
+        candidate_id=candidate_id,
+        seed=config.seed,
+        baseline_program=baseline_program,
+        strict_invalid_policy=config.strict_invalid_policy,
+        artifact_dir=artifact_dir,
+        cost_meter=cost_meter,
+        rollout_cache=rollout_cache,
+        schema_generation_calls=schema_generation_calls,
+        run_id=run_id,
+    )
+    budget.record_result(result)
+    return result
+
+
+def _can_start_budget(
+    budget: BudgetTracker,
+    *,
+    min_target_task_calls: int = 0,
+    min_prompt_tokens: int = 0,
+    min_completion_tokens: int = 0,
+    min_dollar_cost: float = 0.0,
+    reserve_target_task_calls: int = 0,
+    reserve_estimate: EvaluationBudgetEstimate | None = None,
+) -> bool:
+    reserve = reserve_estimate or EvaluationBudgetEstimate()
+    return (not budget.exhausted) and budget.can_start(
+        min_target_task_calls=min_target_task_calls
+        + reserve_target_task_calls
+        + reserve.target_task_calls,
+        min_prompt_tokens=min_prompt_tokens + reserve.prompt_tokens,
+        min_completion_tokens=min_completion_tokens + reserve.completion_tokens,
+        min_dollar_cost=min_dollar_cost + reserve.dollar_cost,
+    )
+
+
+def _make_budget_tracker(config: FixedPoolConfig) -> BudgetTracker:
+    return BudgetTracker(
+        BudgetLimits(
+            max_target_task_calls=config.max_target_task_calls,
+            max_prompt_tokens=config.max_prompt_tokens,
+            max_completion_tokens=config.max_completion_tokens,
+            max_total_tokens=config.max_total_tokens,
+            max_dollar_cost=config.max_dollar_cost,
+        )
+    )
+
+
+def _cost_summary(
+    *,
+    eval_results: tuple[CandidateEvalResult, ...],
+    field_ablation_results: tuple[FieldAblationResult, ...],
+    proposal_usage: dict[str, float | int] | None = None,
+) -> dict[str, float | int]:
+    usage = proposal_usage or _empty_proposal_usage()
+    latency_results = (*eval_results, *field_ablation_results)
+    return {
+        "evaluations": len(eval_results) + len(field_ablation_results),
+        "target_task_calls": sum(result.target_task_calls for result in eval_results)
+        + sum(result.target_task_calls for result in field_ablation_results),
+        "optimizer_proposal_calls": sum(result.optimizer_proposal_calls for result in eval_results)
+        + int(usage.get("optimizer_proposal_calls", 0)),
+        "optimizer_reflection_calls": sum(result.optimizer_reflection_calls for result in eval_results)
+        + int(usage.get("optimizer_reflection_calls", 0)),
+        "schema_generation_calls": sum(result.schema_generation_calls for result in eval_results),
+        "schema_validation_repair_calls": sum(
+            result.schema_validation_repair_calls for result in eval_results
+        ),
+        "retriever_calls": sum(result.retriever_calls for result in eval_results),
+        "prompt_tokens": sum(result.prompt_tokens for result in eval_results)
+        + sum(result.prompt_tokens for result in field_ablation_results)
+        + int(usage.get("prompt_tokens", 0)),
+        "completion_tokens": sum(result.completion_tokens for result in eval_results)
+        + sum(result.completion_tokens for result in field_ablation_results)
+        + int(usage.get("completion_tokens", 0)),
+        "total_tokens": sum(result.prompt_tokens + result.completion_tokens for result in eval_results)
+        + sum(
+            result.prompt_tokens + result.completion_tokens
+            for result in field_ablation_results
+        )
+        + int(usage.get("total_tokens", 0)),
+        "dollar_cost": sum(result.dollar_cost for result in eval_results)
+        + sum(result.dollar_cost for result in field_ablation_results)
+        + float(usage.get("dollar_cost", 0.0)),
+        "wall_clock_seconds": sum(result.wall_clock_seconds for result in latency_results),
+        "max_p50_latency_ms": max(
+            (result.p50_latency_ms for result in latency_results),
+            default=0.0,
+        ),
+        "max_p95_latency_ms": max(
+            (result.p95_latency_ms for result in latency_results),
+            default=0.0,
+        ),
+    }
+
+
+def _proposal_usage_from_proposer(proposer: SchemaProposer | None) -> dict[str, float | int]:
+    usage = getattr(proposer, "total_usage", None)
+    if not isinstance(usage, dict):
+        usage = getattr(proposer, "last_usage", None)
+    if not isinstance(usage, dict):
+        return _empty_proposal_usage()
+    normalized = _empty_proposal_usage()
+    for key in normalized:
+        if key in usage:
+            normalized[key] = usage[key]
+    return normalized
+
+
+def _reset_proposal_usage(proposer: SchemaProposer | None) -> None:
+    if proposer is None:
+        return
+    if hasattr(proposer, "last_usage"):
+        setattr(proposer, "last_usage", _empty_proposal_usage())
+    if hasattr(proposer, "total_usage"):
+        setattr(proposer, "total_usage", _empty_proposal_usage())
+
+
+def _record_proposal_usage_delta(
+    *,
+    budget: BudgetTracker,
+    previous: dict[str, float | int],
+    current: dict[str, float | int],
+) -> None:
+    delta = _proposal_usage_delta(previous=previous, current=current)
+    _record_proposal_usage(budget, delta)
+
+
+def _proposal_usage_delta(
+    *,
+    previous: dict[str, float | int],
+    current: dict[str, float | int],
+) -> dict[str, float | int]:
+    delta = _empty_proposal_usage()
+    for key in delta:
+        if key == "dollar_cost":
+            delta[key] = max(0.0, float(current.get(key, 0.0)) - float(previous.get(key, 0.0)))
+        else:
+            delta[key] = max(0, int(current.get(key, 0)) - int(previous.get(key, 0)))
+    return delta
+
+
+def _record_proposal_usage(budget: BudgetTracker, usage: dict[str, float | int]) -> None:
+    result = type("ProposalUsageResult", (), {})()
+    result.target_task_calls = 0
+    result.prompt_tokens = int(usage.get("prompt_tokens", 0))
+    result.completion_tokens = int(usage.get("completion_tokens", 0))
+    result.dollar_cost = float(usage.get("dollar_cost", 0.0))
+    budget.record_result(result)
+
+
+def _empty_proposal_usage() -> dict[str, float | int]:
+    return {
+        "optimizer_proposal_calls": 0,
+        "optimizer_reflection_calls": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "dollar_cost": 0.0,
+    }
 
 
 def _run_reflection_rounds(
@@ -584,7 +1107,8 @@ def _run_reflection_rounds(
     compiled_candidates: tuple[LMProgram, ...],
     smoke_results: tuple[CandidateEvalResult, ...],
     selection_results: tuple[CandidateEvalResult, ...],
-    train_like_examples: tuple[ProgramExample, ...],
+    train_traces: tuple[TraceExample, ...],
+    selection_examples: tuple[ProgramExample, ...],
     smoke_examples: tuple[ProgramExample, ...],
     scorer: Scorer,
     config: FixedPoolConfig,
@@ -595,6 +1119,8 @@ def _run_reflection_rounds(
     baseline_cost: float,
     cost_meter: CostMeter,
     rollout_cache: RolloutCache,
+    budget: BudgetTracker,
+    reserve_target_task_calls: int = 0,
 ) -> tuple[
     tuple[SchemaCandidate, ...],
     tuple[LMProgram, ...],
@@ -603,7 +1129,7 @@ def _run_reflection_rounds(
     tuple[dict[str, Any], ...],
 ]:
     metadata: list[dict[str, Any]] = []
-    if any(example.split != "train" for example in train_like_examples):
+    if any(trace.split != "train" for trace in train_traces):
         return (
             schema_pool,
             compiled_candidates,
@@ -613,7 +1139,7 @@ def _run_reflection_rounds(
                 {
                     "round": 1,
                     "status": "skipped",
-                    "reason": "reflection requires train split examples",
+                    "reason": "reflection requires train split traces",
                 },
             ),
         )
@@ -638,9 +1164,9 @@ def _run_reflection_rounds(
             metadata.append({"round": round_index, "status": "skipped", "reason": "no selection results"})
             break
         primary = top[0]
-        failure_traces = _failure_traces_from_result(
-            result=primary,
-            examples=train_like_examples,
+        failure_traces = _reflection_traces_from_train_traces(
+            traces=train_traces,
+            primary_schema_id=primary.schema_id,
             max_traces=max(1, schemas_per_round * 2),
         )
         if not failure_traces:
@@ -648,7 +1174,7 @@ def _run_reflection_rounds(
                 {
                     "round": round_index,
                     "status": "skipped",
-                    "reason": "primary had no failing train traces",
+                    "reason": "no train traces available for reflection",
                     "primary_schema_id": primary.schema_id,
                 }
             )
@@ -695,6 +1221,8 @@ def _run_reflection_rounds(
                     baseline_cost=baseline_cost,
                     cost_meter=cost_meter,
                     rollout_cache=rollout_cache,
+                    budget=budget,
+                    reserve_target_task_calls=reserve_target_task_calls,
                 )
             )
             if smoke_examples
@@ -734,7 +1262,7 @@ def _run_reflection_rounds(
         new_selection = tuple(
             _evaluate_many(
                 candidates=new_programs,
-                examples=train_like_examples,
+                examples=selection_examples,
                 scorer=scorer,
                 config=config,
                 base_program=base_program,
@@ -743,6 +1271,8 @@ def _run_reflection_rounds(
                 baseline_cost=baseline_cost,
                 cost_meter=cost_meter,
                 rollout_cache=rollout_cache,
+                budget=budget,
+                reserve_target_task_calls=reserve_target_task_calls,
             )
         )
         current_selection.extend(new_selection)
@@ -768,39 +1298,39 @@ def _run_reflection_rounds(
     )
 
 
-def _failure_traces_from_result(
+def _reflection_traces_from_train_traces(
     *,
-    result: CandidateEvalResult,
-    examples: tuple[ProgramExample, ...],
+    traces: tuple[TraceExample, ...],
+    primary_schema_id: str,
     max_traces: int,
 ) -> tuple[TraceExample, ...]:
-    by_id = {example.example_id: example for example in examples}
-    traces: list[TraceExample] = []
-    for prediction, score in zip(result.predictions, result.per_example_scores):
-        if score >= 1.0 and prediction.valid:
-            continue
-        example = by_id.get(prediction.example_id)
-        if example is None:
-            continue
-        traces.append(
+    prioritized = [
+        trace
+        for trace in traces
+        if trace.errors or (trace.score is not None and trace.score < 1.0)
+    ] or list(traces)
+    selected: list[TraceExample] = []
+    for trace in prioritized[:max_traces]:
+        metadata = dict(trace.metadata or {})
+        metadata.update(
+            {
+                "source": "schemaevo_reflection_train_trace",
+                "primary_schema_id": primary_schema_id,
+            }
+        )
+        selected.append(
             TraceExample(
-                example_id=example.example_id,
-                split=example.split,
-                module_name=prediction.schema_id,
-                input_summary=str(example.inputs)[:512],
-                output_summary=str(prediction.final_output)[:512],
-                score=score,
-                errors=tuple(prediction.validation_errors) or ("low_task_score",),
-                metadata={
-                    "source": "schemaevo_reflection",
-                    "schema_id": result.schema_id,
-                    "candidate_id": result.candidate_id,
-                },
+                example_id=trace.example_id,
+                split="train",
+                module_name=trace.module_name,
+                input_summary=trace.input_summary,
+                output_summary=trace.output_summary,
+                score=trace.score,
+                errors=trace.errors or ("train_reflection_trace",),
+                metadata=metadata,
             )
         )
-        if len(traces) >= max_traces:
-            break
-    return tuple(traces)
+    return tuple(selected)
 
 
 def _corrected_confirmation_stats(
