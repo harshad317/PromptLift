@@ -1,0 +1,37 @@
+fixed_pool:
+  task: toy_multihop
+  target_model: toy-model
+  seed: 7
+  n_trace_schemas: 12
+  n_random_schemas: 4
+  schema_token_budget: 512
+  min_smoke_validity: 0.97
+  top_k_confirmation: 3
+  min_confirmation_delta: 0.1
+  bootstrap_resamples: 500
+  randomization_swaps: 500
+  freeze_prompt_text: true
+  allow_only_schema_contract_insert: true
+  strict_invalid_policy: true
+smoke_examples: 4
+selection_examples: 12
+confirmation_examples: 20
+heldout_test_examples: 8
+proposer:
+  kind: heuristic
+  model: gpt-4.1-mini
+  temperature: 0.7
+  max_output_tokens: 4096
+closed_loop:
+  task: toy_multihop
+  seed: 13
+  max_program_rollouts: 9
+  max_mutation_attempts: 40
+  minibatch_size: 8
+  schema_token_budget: 512
+  initial_random_schemas: 2
+  k_final: 3
+  freeze_prompt_text: true
+  allow_prompt_mutation: false
+  strict_invalid_policy: true
+closed_loop_examples: 24
