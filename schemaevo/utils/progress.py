@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from typing import Literal, TypeVar
 
 ProgressMode = Literal["auto", "rich", "tqdm", "none"]
@@ -24,6 +25,41 @@ def progress_iter(
         yield from _tqdm_progress(iterable, total=total, description=description)
         return
     yield from iterable
+
+
+@contextmanager
+def progress_status(
+    description: str,
+    *,
+    mode: ProgressMode = "auto",
+) -> Iterator[None]:
+    selected = _select_progress_mode(mode)
+    label = description or "working"
+    if selected == "rich":
+        from rich.console import Console
+
+        console = Console(stderr=True)
+        console.print(f"{label}...")
+        try:
+            with console.status(label):
+                yield
+        except Exception:
+            console.print(f"{label} failed")
+            raise
+        console.print(f"{label} done")
+        return
+    if selected == "tqdm":
+        from tqdm.auto import tqdm
+
+        tqdm.write(f"{label}...", file=sys.stderr)
+        try:
+            yield
+        except Exception:
+            tqdm.write(f"{label} failed", file=sys.stderr)
+            raise
+        tqdm.write(f"{label} done", file=sys.stderr)
+        return
+    yield
 
 
 def _select_progress_mode(mode: ProgressMode) -> ProgressMode:
@@ -68,7 +104,7 @@ def _rich_progress(
         TaskProgressColumn(),
         TimeElapsedColumn(),
         console=console,
-        transient=True,
+        transient=False,
     ) as progress:
         task_id = progress.add_task(description or "working", total=total)
         for item in iterable:
@@ -89,6 +125,6 @@ def _tqdm_progress(
         total=total,
         desc=description or None,
         file=sys.stderr,
-        leave=False,
+        leave=True,
         dynamic_ncols=True,
     )

@@ -591,8 +591,6 @@ def _prepare_openai_fixed_pool_run(
         heldout_path=heldout_path,
         require_context=require_context,
     )
-    if strict_readiness and not readiness.ready:
-        return readiness.to_dict()
     raw = _load_yaml(config_path)
     fixed_pool_config = FixedPoolConfig(**raw.get("fixed_pool", {}))
     proposer_config = raw.get("proposer", {})
@@ -631,11 +629,11 @@ def _prepare_openai_fixed_pool_run(
         config=fixed_pool_config,
         selected_model=str(selected_model),
     )
-    if strict_readiness and accounting_reasons:
+    if strict_readiness and (not readiness.ready or accounting_reasons):
         output = readiness.to_dict()
         output["ready"] = False
         output["accounting"] = {
-            "ok": False,
+            "ok": not accounting_reasons,
             "reasons": accounting_reasons,
             "selected_model": str(selected_model),
         }

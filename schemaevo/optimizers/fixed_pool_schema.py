@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+import pickle
 from typing import Any
 
 from schemaevo.eval.budgeting import EvaluationBudgetEstimate, estimate_evaluation_budget
@@ -21,7 +22,7 @@ from schemaevo.schemas.human_templates import make_human_minimal_schemas, make_v
 from schemaevo.schemas.proposer import SchemaProposer, TraceExample, propose_schemas_from_traces
 from schemaevo.schemas.random_controls import make_random_schema_controls
 from schemaevo.schemas.serialization import freeze_jsonl, write_json
-from schemaevo.utils.progress import ProgressMode, progress_iter
+from schemaevo.utils.progress import ProgressMode, progress_iter, progress_status
 
 
 @dataclass(frozen=True)
@@ -179,16 +180,18 @@ def run_fixed_pool_schema_mvp(
         max_schema_tokens=config.schema_token_budget,
     )
     _reset_proposal_usage(proposer)
-    schema_pool = _build_schema_pool(
-        traces=train_traces,
-        task=config.task,
-        module_names=module_names,
-        config=config,
-        proposer=proposer,
-    )
+    with progress_status("schema proposal", mode=config.progress):
+        schema_pool = _build_schema_pool(
+            traces=train_traces,
+            task=config.task,
+            module_names=module_names,
+            config=config,
+            proposer=proposer,
+        )
     recorded_proposal_usage = _proposal_usage_from_proposer(proposer)
     _record_proposal_usage(budget, recorded_proposal_usage)
-    schema_pool = tuple(_static_filter(schema_pool, grammar))
+    with progress_status("static schema checks", mode=config.progress):
+        schema_pool = tuple(_static_filter(schema_pool, grammar))
     if not schema_pool:
         raise RuntimeError("schema pool is empty after static checks")
     schema_pool_path = ""
@@ -196,7 +199,13 @@ def run_fixed_pool_schema_mvp(
         schema_pool_path = str(freeze_jsonl(schema_pool, artifact_root / "schemas" / "frozen_pool.jsonl"))
 
     compiled_candidates = tuple(
-        _compile_candidate(base_program=base_program, schema=schema, config=config) for schema in schema_pool
+        _compile_candidate(base_program=base_program, schema=schema, config=config)
+        for schema in progress_iter(
+            schema_pool,
+            total=len(schema_pool),
+            description="compile schemas",
+            mode=config.progress,
+        )
     )
     confirmation_pair_calls = len(confirmation_examples) * base_program.calls_per_example * 2
     selection_min_calls = len(selection_examples) * base_program.calls_per_example
@@ -453,20 +462,21 @@ def run_fixed_pool_schema_mvp(
             n_swaps=config.randomization_swaps,
             seed=config.seed + 1000,
         )
-    field_ablation_results = tuple(
-        run_field_use_ablations(
-            program=primary_program,
-            examples=confirmation_examples,
-            scorer=scorer,
-            unablated_result=primary_confirmation,
-            fields=primary_program.schema_candidate.evolved_field_names if primary_program.schema_candidate else (),
-            seed=config.seed,
-            artifact_dir=artifact_root,
-            cost_meter=cost_meter,
-            budget=budget,
-            progress=config.progress,
+    with progress_status("field ablations", mode=config.progress):
+        field_ablation_results = tuple(
+            run_field_use_ablations(
+                program=primary_program,
+                examples=confirmation_examples,
+                scorer=scorer,
+                unablated_result=primary_confirmation,
+                fields=primary_program.schema_candidate.evolved_field_names if primary_program.schema_candidate else (),
+                seed=config.seed,
+                artifact_dir=artifact_root,
+                cost_meter=cost_meter,
+                budget=budget,
+                progress=config.progress,
+            )
         )
-    )
     decision = _make_decision(
         baseline=baseline_confirmation,
         best=primary_confirmation,
@@ -850,13 +860,38 @@ def _evaluate_many_parallel(
     description: str,
 ) -> list[CandidateEvalResult]:
     max_workers = min(workers, len(jobs))
+    if not _jobs_are_process_picklable(jobs):
+        return _evaluate_many_thread_pool(
+            jobs=jobs,
+            budget=budget,
+            progress=progress,
+            max_workers=max_workers,
+            description=description,
+        )
+    return _evaluate_many_process_pool(
+        jobs=jobs,
+        budget=budget,
+        progress=progress,
+        max_workers=max_workers,
+        description=description,
+    )
+
+
+def _evaluate_many_process_pool(
+    *,
+    jobs: list[_CandidateEvalJob],
+    budget: BudgetTracker,
+    progress: ProgressMode,
+    max_workers: int,
+    description: str,
+) -> list[CandidateEvalResult]:
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        mapped = executor.map(_evaluate_candidate_job_in_subprocess, jobs)
+        mapped = executor.map(_evaluate_candidate_job_in_worker, jobs)
         results = list(
             progress_iter(
                 mapped,
                 total=len(jobs),
-                description=f"{description} [{max_workers} workers]",
+                description=f"{description} [{max_workers} processes]",
                 mode=progress,
             )
         )
@@ -865,7 +900,38 @@ def _evaluate_many_parallel(
     return results
 
 
-def _evaluate_candidate_job_in_subprocess(job: _CandidateEvalJob) -> CandidateEvalResult:
+def _evaluate_many_thread_pool(
+    *,
+    jobs: list[_CandidateEvalJob],
+    budget: BudgetTracker,
+    progress: ProgressMode,
+    max_workers: int,
+    description: str,
+) -> list[CandidateEvalResult]:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        mapped = executor.map(_evaluate_candidate_job_in_worker, jobs)
+        results = list(
+            progress_iter(
+                mapped,
+                total=len(jobs),
+                description=f"{description} [{max_workers} threads]",
+                mode=progress,
+            )
+        )
+    for result in results:
+        budget.record_result(result)
+    return results
+
+
+def _jobs_are_process_picklable(jobs: list[_CandidateEvalJob]) -> bool:
+    try:
+        pickle.dumps(jobs)
+    except Exception:
+        return False
+    return True
+
+
+def _evaluate_candidate_job_in_worker(job: _CandidateEvalJob) -> CandidateEvalResult:
     cost_meter = make_cost_meter(
         model_prices=job.config.model_prices,
         use_tiktoken=job.config.use_tiktoken_costing,
@@ -934,21 +1000,22 @@ def _evaluate_required_with_budget(
         reserve_target_task_calls=reserve_target_task_calls,
     ):
         raise RuntimeError(f"budget exhausted before {stage}: {budget.summary()}")
-    result = evaluate_program(
-        program=program,
-        examples=examples,
-        scorer=scorer,
-        method=method,
-        candidate_id=candidate_id,
-        seed=config.seed,
-        baseline_program=baseline_program,
-        strict_invalid_policy=config.strict_invalid_policy,
-        artifact_dir=artifact_dir,
-        cost_meter=cost_meter,
-        rollout_cache=rollout_cache,
-        schema_generation_calls=schema_generation_calls,
-        run_id=run_id,
-    )
+    with progress_status(stage, mode=config.progress):
+        result = evaluate_program(
+            program=program,
+            examples=examples,
+            scorer=scorer,
+            method=method,
+            candidate_id=candidate_id,
+            seed=config.seed,
+            baseline_program=baseline_program,
+            strict_invalid_policy=config.strict_invalid_policy,
+            artifact_dir=artifact_dir,
+            cost_meter=cost_meter,
+            rollout_cache=rollout_cache,
+            schema_generation_calls=schema_generation_calls,
+            run_id=run_id,
+        )
     budget.record_result(result)
     return result
 
@@ -1179,20 +1246,22 @@ def _run_reflection_rounds(
                 }
             )
             break
-        proposed = propose_schemas_from_traces(
-            traces=failure_traces,
-            task=config.task,
-            module_names=module_names,
-            n=schemas_per_round,
-            seed=config.seed + 10_000 + round_index,
-            schema_token_budget=config.schema_token_budget,
-            proposer=proposer,
-        )
-        filtered = [
-            schema
-            for schema in _static_filter(tuple(proposed), grammar)
-            if schema.schema_id not in existing_schema_ids
-        ]
+        with progress_status(f"reflection {round_index} schema proposal", mode=config.progress):
+            proposed = propose_schemas_from_traces(
+                traces=failure_traces,
+                task=config.task,
+                module_names=module_names,
+                n=schemas_per_round,
+                seed=config.seed + 10_000 + round_index,
+                schema_token_budget=config.schema_token_budget,
+                proposer=proposer,
+            )
+        with progress_status(f"reflection {round_index} static schema checks", mode=config.progress):
+            filtered = [
+                schema
+                for schema in _static_filter(tuple(proposed), grammar)
+                if schema.schema_id not in existing_schema_ids
+            ]
         if not filtered:
             metadata.append(
                 {
@@ -1206,7 +1275,12 @@ def _run_reflection_rounds(
             continue
         new_programs = tuple(
             _compile_candidate(base_program=base_program, schema=schema, config=config)
-            for schema in filtered
+            for schema in progress_iter(
+                filtered,
+                total=len(filtered),
+                description=f"reflection {round_index} compile schemas",
+                mode=config.progress,
+            )
         )
         new_smoke = (
             tuple(

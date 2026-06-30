@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import threading
 
 import pytest
 import yaml
@@ -33,6 +34,7 @@ from schemaevo.experiments.causal_pilot import build_causal_pilot_report
 from schemaevo.experiments.deployment_invariance import build_fixed_pool_deployment_report
 from schemaevo.experiments.external_prompt_optimizer import ExternalPromptOptimizer
 from schemaevo.experiments.composability import run_prompt_optimizer_then_schemaevo
+from schemaevo.experiments.transfer import run_openai_cross_model_schema_transfer
 from schemaevo.optimizers.fixed_pool_schema import FixedPoolConfig, run_fixed_pool_schema_mvp
 from schemaevo.optimizers.schema_evo import SchemaEvoConfig, merge_schema_candidates, schema_evo_optimize
 from schemaevo.programs.base import ProgramExample
@@ -803,6 +805,214 @@ def test_fixed_pool_multiprocessing_candidate_eval_runs(tmp_path):
     assert result.primary_confirmation_result.mean_score == 1.0
     assert len(result.selection_results) >= 2
     assert (tmp_path / "results" / "mvp_summary.json").exists()
+
+
+def test_fixed_pool_parallel_openai_jobs_fall_back_to_threads_for_unpicklable_client(tmp_path):
+    calls = []
+
+    class FakeResponses:
+        def __init__(self) -> None:
+            self.lock = threading.RLock()
+
+        def create(self, **kwargs):
+            with self.lock:
+                calls.append(kwargs["text"]["format"]["name"])
+            schema = kwargs["text"]["format"]["schema"]
+            payload = {
+                field_name: _fake_openai_value(field_name, schema["properties"][field_name])
+                for field_name in schema["required"]
+            }
+
+            class Response:
+                output_text = json.dumps(payload)
+
+            return Response()
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.responses = FakeResponses()
+
+    program = openai_modules_to_lm_program(
+        task="HotpotQA",
+        modules=(
+            OpenAIModuleConfig(
+                name="planner",
+                input_fields=("question", "context"),
+                output_fields=("plan",),
+                prompt="Plan the answer.",
+                model="gpt-4.1-mini",
+                max_output_tokens=64,
+            ),
+            OpenAIModuleConfig(
+                name="answerer",
+                input_fields=("question", "context", "plan"),
+                output_fields=("answer",),
+                prompt="Answer.",
+                model="gpt-4.1-mini",
+                max_output_tokens=64,
+            ),
+        ),
+        final_output_module="answerer",
+        client=FakeClient(),
+    )
+
+    def make_openai_examples(split: str) -> tuple[ProgramExample, ...]:
+        return tuple(
+            ProgramExample(
+                example_id=f"openai_parallel_{split}_{index}",
+                split=split,
+                inputs={"question": "What is the answer?", "context": "The answer is ok."},
+                expected={"answer": "ok"},
+            )
+            for index in range(2)
+        )
+
+    def score(example, prediction):
+        return float(prediction.final_output.get("answer") == example.expected["answer"])
+
+    result = run_fixed_pool_schema_mvp(
+        base_program=program,
+        train_traces=make_toy_traces(),
+        smoke_examples=(),
+        selection_examples=make_openai_examples("selection"),
+        confirmation_examples=make_openai_examples("confirmation"),
+        scorer=score,
+        config=FixedPoolConfig(
+            task="HotpotQA",
+            target_model="gpt-4.1-mini",
+            seed=61,
+            n_trace_schemas=1,
+            n_random_schemas=0,
+            top_k_confirmation=1,
+            bootstrap_resamples=10,
+            randomization_swaps=10,
+            workers=2,
+            progress="none",
+        ),
+        artifact_dir=tmp_path,
+    )
+
+    assert result.primary_confirmation_result.mean_score == 1.0
+    assert len(calls) > 0
+
+
+def test_cross_model_transfer_runs_with_fake_openai_client(tmp_path):
+    calls = []
+
+    class FakeResponses:
+        def create(self, **kwargs):
+            user_payload = json.loads(kwargs["input"][1]["content"])
+            calls.append((kwargs["model"], user_payload["module_name"]))
+            schema = kwargs["text"]["format"]["schema"]
+            payload = {}
+            for field_name in schema["required"]:
+                if field_name == "answer":
+                    payload[field_name] = "ok" if user_payload.get("schema_fields") else "wrong"
+                else:
+                    payload[field_name] = _fake_openai_value(field_name, schema["properties"][field_name])
+
+            class Response:
+                output_text = json.dumps(payload)
+
+            return Response()
+
+    class FakeClient:
+        responses = FakeResponses()
+
+    def write_hotpot_split(path: Path, split: str) -> None:
+        path.write_text(
+            json.dumps(
+                [
+                    {
+                        "_id": f"{split}_{index}",
+                        "question": "What is the answer?",
+                        "answer": "ok",
+                        "context": [["Title", ["The answer is ok."]]],
+                    }
+                    for index in range(2)
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    train_path = tmp_path / "train.json"
+    selection_path = tmp_path / "selection.json"
+    confirmation_path = tmp_path / "confirmation.json"
+    heldout_path = tmp_path / "heldout.json"
+    write_hotpot_split(train_path, "train")
+    write_hotpot_split(selection_path, "selection")
+    write_hotpot_split(confirmation_path, "confirmation")
+    write_hotpot_split(heldout_path, "heldout")
+
+    report = run_openai_cross_model_schema_transfer(
+        benchmark_config=OpenAIFixedPoolBenchmarkConfig(
+            dataset="hotpotqa",
+            train_path=train_path,
+            selection_path=selection_path,
+            confirmation_path=confirmation_path,
+            heldout_path=heldout_path,
+            train_limit=2,
+            selection_limit=2,
+            confirmation_limit=2,
+            heldout_limit=2,
+            model="source-model",
+        ),
+        source_model="source-model",
+        target_model="target-model",
+        fixed_pool_config=FixedPoolConfig(
+            task="HotpotQA",
+            target_model="source-model",
+            seed=71,
+            n_trace_schemas=1,
+            n_random_schemas=0,
+            top_k_confirmation=1,
+            bootstrap_resamples=10,
+            randomization_swaps=10,
+            reflection_rounds=1,
+            workers=1,
+            progress="none",
+        ),
+        artifact_dir=tmp_path / "transfer",
+        proposer=HeuristicTraceSchemaProposer(),
+        client=FakeClient(),
+    )
+
+    assert report.transferred_schema_id
+    assert report.source_delta == 1.0
+    assert report.target_delta == 1.0
+    assert report.schema_transfer_retention == 1.0
+    assert (tmp_path / "transfer" / "cross_model_transfer_report.json").exists()
+    assert ("source-model", "answerer") in calls
+    assert ("target-model", "answerer") in calls
+
+
+def _fake_openai_value(field_name: str, schema: dict[str, object]) -> object:
+    enum_values = schema.get("enum")
+    if isinstance(enum_values, list) and enum_values:
+        return enum_values[0]
+    schema_type = schema.get("type", "string")
+    if isinstance(schema_type, list):
+        schema_type = next((item for item in schema_type if item != "null"), "string")
+    if field_name == "answer":
+        return "ok"
+    if schema_type == "array":
+        return []
+    if schema_type == "object":
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        if isinstance(properties, dict) and isinstance(required, list):
+            return {
+                str(name): _fake_openai_value(str(name), properties[str(name)])
+                for name in required
+            }
+        return {"value": ""}
+    if schema_type == "boolean":
+        return False
+    if schema_type == "integer":
+        return 1
+    if schema_type == "number":
+        return 1.0
+    return "ok" if field_name == "plan" else ""
 
 
 def test_closed_loop_config_rejects_negative_budget_caps():
@@ -1727,6 +1937,55 @@ def test_cli_run_openai_fixed_pool_fails_readiness_without_key(tmp_path, monkeyp
     assert exit_code == 1
     assert output["ready"] is False
     assert "OPENAI_API_KEY is not set" in output["reasons"]
+
+
+def test_cli_run_openai_fixed_pool_reports_readiness_and_accounting_blockers_together(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+
+    def fake_find_spec(name):
+        return None if name == "openai" else object()
+
+    monkeypatch.setattr("schemaevo.benchmarks.readiness.importlib.util.find_spec", fake_find_spec)
+    for name in ("train", "selection", "confirmation"):
+        (tmp_path / f"{name}.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "_id": name,
+                        "question": "What is the answer?",
+                        "answer": "alpha",
+                        "context": [["Title", ["alpha is supported."]]],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    exit_code = cli_main(
+        [
+            "run-openai-fixed-pool",
+            "--config",
+            "configs/mvp_hotpotqa_gpt41mini.yaml",
+            "--dataset",
+            "hotpotqa",
+            "--train",
+            str(tmp_path / "train.json"),
+            "--selection",
+            str(tmp_path / "selection.json"),
+            "--confirmation",
+            str(tmp_path / "confirmation.json"),
+        ]
+    )
+    output = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 1
+    assert output["ready"] is False
+    assert output["openai_package"] is False
+    assert output["accounting"]["ok"] is False
+    assert "openai package is not installed" in output["reasons"]
+    assert any("missing pricing table" in reason for reason in output["reasons"])
 
 
 def test_cli_run_openai_fixed_pool_requires_model_prices(tmp_path, monkeypatch, capsys):

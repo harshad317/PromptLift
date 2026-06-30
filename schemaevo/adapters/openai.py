@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import os
+import threading
 from typing import Any
 
 from schemaevo.programs.base import (
@@ -75,6 +76,19 @@ def _module_spec_from_config(config: OpenAIModuleConfig, *, client: Any | None) 
 class OpenAIResponsesRunner:
     def __init__(self, client: Any | None = None) -> None:
         self.api_client = client
+        self._has_explicit_client = client is not None
+        self._thread_local = threading.local()
+
+    def __getstate__(self) -> dict[str, Any]:
+        return {
+            "api_client": self.api_client if self._has_explicit_client else None,
+            "_has_explicit_client": self._has_explicit_client,
+        }
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.api_client = state.get("api_client")
+        self._has_explicit_client = bool(state.get("_has_explicit_client", self.api_client is not None))
+        self._thread_local = threading.local()
 
     def __call__(
         self,
@@ -83,8 +97,7 @@ class OpenAIResponsesRunner:
         example: ProgramExample,
         context: ModuleExecutionContext,
     ) -> dict[str, Any]:
-        if self.api_client is None:
-            self.api_client = _make_openai_client()
+        api_client = self._client()
         module_input = _build_module_input(state=state, spec=spec, example=example)
         create_kwargs: dict[str, Any] = {
             "model": spec.model,
@@ -124,8 +137,17 @@ class OpenAIResponsesRunner:
         temperature = spec.metadata.get("temperature")
         if temperature is not None:
             create_kwargs["temperature"] = float(temperature)
-        response = self.api_client.responses.create(**create_kwargs)
+        response = api_client.responses.create(**create_kwargs)
         return _extract_response_json(response)
+
+    def _client(self) -> Any:
+        if self._has_explicit_client:
+            return self.api_client
+        api_client = getattr(self._thread_local, "api_client", None)
+        if api_client is None:
+            api_client = _make_openai_client()
+            self._thread_local.api_client = api_client
+        return api_client
 
 
 def _make_openai_client() -> Any:
