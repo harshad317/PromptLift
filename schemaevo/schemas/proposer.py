@@ -7,6 +7,7 @@ import random
 from typing import Any, Protocol
 
 from schemaevo.schemas.candidate import ConsumptionRule, SchemaCandidate, SchemaField
+from schemaevo.schemas.grammar import SchemaGrammar
 from schemaevo.schemas.human_templates import make_hotpotqa_schema_candidate, make_hover_schema_candidate
 
 
@@ -121,11 +122,14 @@ class OpenAISchemaProposer:
         temperature: float = 0.7,
         max_output_tokens: int = 4096,
         client: Any | None = None,
+        raise_on_error: bool = False,
     ) -> None:
         self.model = model
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
         self.client = client
+        self.raise_on_error = raise_on_error
+        self.last_errors: list[str] = []
 
     def propose(
         self,
@@ -138,57 +142,65 @@ class OpenAISchemaProposer:
         schema_token_budget: int,
     ) -> list[SchemaCandidate]:
         _assert_train_only(traces)
+        self.last_errors = []
         if n <= 0:
             return []
-        client = self.client or _make_openai_client()
-        response = client.responses.create(
-            model=self.model,
-            input=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You propose SchemaEvo intermediate schema contracts for multi-module "
-                        "LLM programs. Return only fields that preserve the fixed call graph: no "
-                        "extra LLM calls, no extra retrieval, no self-consistency, no tools, no test "
-                        "labels. Use snake_case field names and executable validator constraints "
-                        "when possible."
-                    ),
+        try:
+            client = self.client or _make_openai_client()
+            response = client.responses.create(
+                model=self.model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You propose SchemaEvo intermediate schema contracts for multi-module "
+                            "LLM programs. Return only fields that preserve the fixed call graph: no "
+                            "extra LLM calls, no extra retrieval, no self-consistency, no tools, no test "
+                            "labels. Use snake_case field names and executable validator constraints "
+                            "when possible."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "task": task,
+                                "module_names": module_names,
+                                "schema_count": n,
+                                "schema_token_budget": schema_token_budget,
+                                "train_traces": [trace.__dict__ for trace in traces],
+                            },
+                            sort_keys=True,
+                            ensure_ascii=True,
+                        ),
+                    },
+                ],
+                temperature=self.temperature,
+                max_output_tokens=self.max_output_tokens,
+                text={
+                    "format": {
+                        "type": "json_schema",
+                        "name": "schemaevo_proposals",
+                        "strict": True,
+                        "schema": _proposal_json_schema(),
+                    }
                 },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "task": task,
-                            "module_names": module_names,
-                            "schema_count": n,
-                            "schema_token_budget": schema_token_budget,
-                            "train_traces": [trace.__dict__ for trace in traces],
-                        },
-                        sort_keys=True,
-                        ensure_ascii=True,
-                    ),
-                },
-            ],
-            temperature=self.temperature,
-            max_output_tokens=self.max_output_tokens,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "schemaevo_proposals",
-                    "strict": True,
-                    "schema": _proposal_json_schema(),
-                }
-            },
-        )
-        payload = _extract_response_json(response)
-        candidates = _candidates_from_openai_payload(
-            payload=payload,
-            task=task,
-            module_names=module_names,
-            seed=seed,
-            schema_token_budget=schema_token_budget,
-            model=self.model,
-        )
+            )
+            payload = _extract_response_json(response)
+            candidates = _candidates_from_openai_payload(
+                payload=payload,
+                task=task,
+                module_names=module_names,
+                seed=seed,
+                schema_token_budget=schema_token_budget,
+                model=self.model,
+                errors=self.last_errors,
+            )
+        except Exception as exc:
+            if self.raise_on_error:
+                raise
+            self.last_errors.append(f"openai_proposal_failed: {exc}")
+            return []
         return _dedupe(candidates)[:n]
 
 
@@ -328,69 +340,90 @@ def _candidates_from_openai_payload(
     seed: int,
     schema_token_budget: int,
     model: str,
+    errors: list[str] | None = None,
 ) -> list[SchemaCandidate]:
     module_set = set(module_names)
+    grammar = SchemaGrammar(allowed_modules=module_names, max_schema_tokens=schema_token_budget)
     candidates: list[SchemaCandidate] = []
     for index, proposal in enumerate(payload.get("schemas", [])):
         fields_by_module: dict[str, list[SchemaField]] = {}
         for item in proposal.get("fields", []):
-            producer = item["producer_module"]
-            if producer not in module_set:
-                producer = module_names[0]
-            consumers = tuple(
-                consumer for consumer in item["consumer_modules"] if consumer in module_set
-            ) or (module_names[-1],)
-            field = SchemaField(
-                name=item["name"],
-                type=item["type"],
-                description=item["description"],
-                required=bool(item["required"]),
-                producer_module=producer,
-                consumer_modules=consumers,
-                enum_values=tuple(item["enum_values"]) if item.get("enum_values") else None,
-                max_items=item.get("max_items"),
-                max_tokens=item.get("max_tokens"),
-                validation_rule=item.get("validator") or None,
-                causal_hypothesis=item.get("causal_hypothesis"),
-            )
+            try:
+                producer = item["producer_module"]
+                if producer not in module_set:
+                    producer = module_names[0]
+                consumers = tuple(
+                    consumer for consumer in item["consumer_modules"] if consumer in module_set
+                ) or (module_names[-1],)
+                field = SchemaField(
+                    name=item["name"],
+                    type=item["type"],
+                    description=item["description"],
+                    required=bool(item["required"]),
+                    producer_module=producer,
+                    consumer_modules=consumers,
+                    enum_values=tuple(item["enum_values"]) if item.get("enum_values") else None,
+                    max_items=item.get("max_items"),
+                    max_tokens=item.get("max_tokens"),
+                    validation_rule=item.get("validator") or None,
+                    causal_hypothesis=item.get("causal_hypothesis"),
+                )
+            except Exception as exc:
+                if errors is not None:
+                    errors.append(f"schema[{index}] field skipped: {exc}")
+                continue
             fields_by_module.setdefault(producer, []).append(field)
         fields = {
             module_name: tuple(module_fields)
             for module_name, module_fields in fields_by_module.items()
         }
-        rules = tuple(
-            ConsumptionRule(
-                consumer_module=consumer,
-                field_name=field.name,
-                instruction=f"Use `{field.name}` as typed evidence from `{field.producer_module}`.",
-                required_behavior="Consume the field without adding calls or changing retrieval.",
-                fallback_if_missing="Use original prompt behavior and preserve uncertainty.",
-            )
-            for module_fields in fields.values()
-            for field in module_fields
-            for consumer in field.consumer_modules
-        )
-        candidate = SchemaCandidate(
-            schema_id=f"openai_schema_{index}",
-            parent_schema_id=None,
-            task=task,
-            module_fields=fields,
-            consumption_rules=rules,
-            validators={
-                field.name: field.validation_rule or ""
+        if not any(fields.values()):
+            if errors is not None:
+                errors.append(f"schema[{index}] skipped: no valid fields")
+            continue
+        try:
+            rules = tuple(
+                ConsumptionRule(
+                    consumer_module=consumer,
+                    field_name=field.name,
+                    instruction=f"Use `{field.name}` as typed evidence from `{field.producer_module}`.",
+                    required_behavior="Consume the field without adding calls or changing retrieval.",
+                    fallback_if_missing="Use original prompt behavior and preserve uncertainty.",
+                )
                 for module_fields in fields.values()
                 for field in module_fields
-            },
-            schema_token_budget=schema_token_budget,
-            mutation_history=("openai_reflective_schema_proposal",),
-            proposer_seed=seed,
-            control_type="schemaevo",
-            metadata={
-                "proposal_index": index,
-                "proposer_model": model,
-                "rationale": proposal.get("rationale", ""),
-            },
-        ).with_id_from_content(prefix="openai")
+                for consumer in field.consumer_modules
+            )
+            candidate = SchemaCandidate(
+                schema_id=f"openai_schema_{index}",
+                parent_schema_id=None,
+                task=task,
+                module_fields=fields,
+                consumption_rules=rules,
+                validators={
+                    field.name: field.validation_rule or ""
+                    for module_fields in fields.values()
+                    for field in module_fields
+                },
+                schema_token_budget=schema_token_budget,
+                mutation_history=("openai_reflective_schema_proposal",),
+                proposer_seed=seed,
+                control_type="schemaevo",
+                metadata={
+                    "proposal_index": index,
+                    "proposer_model": model,
+                    "rationale": proposal.get("rationale", ""),
+                },
+            ).with_id_from_content(prefix="openai")
+        except Exception as exc:
+            if errors is not None:
+                errors.append(f"schema[{index}] skipped: {exc}")
+            continue
+        static_check = grammar.check_candidate(candidate)
+        if not static_check.passed:
+            if errors is not None:
+                errors.append(f"schema[{index}] skipped: {'; '.join(static_check.errors)}")
+            continue
         candidates.append(candidate)
     return candidates
 

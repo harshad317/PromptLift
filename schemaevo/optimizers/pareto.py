@@ -15,6 +15,7 @@ class CandidateRecord:
     program: LMProgram
     result: CandidateEvalResult
     mutation: Mutation | None = None
+    stage: str = "single_batch"
 
 
 class ParetoFront:

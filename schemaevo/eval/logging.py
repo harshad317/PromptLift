@@ -144,16 +144,23 @@ def make_module_log(
     module_output: Any,
     latency_start: float,
     cost: float,
+    prompt_tokens: int | None = None,
     completion_tokens: int | None = None,
+    cached_tokens: int = 0,
 ) -> ModuleCallLog:
     latency_ms = int((time.perf_counter() - latency_start) * 1000)
-    prompt_tokens = approximate_token_count(module_prompt + json.dumps(module_input, default=str))
+    computed_prompt_tokens = (
+        prompt_tokens
+        if prompt_tokens is not None
+        else approximate_token_count(module_prompt + json.dumps(module_input, default=str))
+    )
     output_text = json.dumps(module_output, sort_keys=True, ensure_ascii=True, default=str)
     usage = Usage(
-        prompt_tokens=prompt_tokens,
+        prompt_tokens=computed_prompt_tokens,
         completion_tokens=completion_tokens
         if completion_tokens is not None
         else approximate_token_count(output_text),
+        cached_tokens=cached_tokens,
     )
     return ModuleCallLog(
         run_id=context.run_id,

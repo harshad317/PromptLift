@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import random
 from typing import Any
 
 from schemaevo.eval.cache import RolloutCache
+from schemaevo.eval.cost_ledger import BudgetLimits, BudgetTracker, CostMeter, make_cost_meter
 from schemaevo.eval.scoring import CandidateEvalResult, Scorer, evaluate_program
 from schemaevo.optimizers.minibatching import StratifyKey, sample_minibatch
 from schemaevo.optimizers.pareto import CandidateRecord, ParetoFront
@@ -37,6 +38,20 @@ class SchemaEvoConfig:
     strict_invalid_policy: bool = True
     min_static_checks: bool = True
     enable_schema_merge: bool = True
+    allocation_strategy: str = "single_batch"
+    successive_halving_eta: int = 2
+    successive_halving_min_batch_size: int = 0
+    successive_halving_promote_fraction: float = 0.5
+    parent_selection_strategy: str = "ucb"
+    parent_ucb_exploration: float = 0.25
+    operator_ucb_exploration: float = 0.4
+    use_tiktoken_costing: bool = False
+    model_prices: dict[str, dict[str, float | str]] = field(default_factory=dict)
+    max_target_task_calls: int | None = None
+    max_prompt_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    max_total_tokens: int | None = None
+    max_dollar_cost: float | None = None
 
     def __post_init__(self) -> None:
         if self.max_program_rollouts <= 0:
@@ -55,27 +70,50 @@ class SchemaEvoConfig:
             raise ValueError("k_final must be positive")
         if self.freeze_prompt_text and self.allow_prompt_mutation:
             raise ValueError("freeze_prompt_text and allow_prompt_mutation cannot both be true")
+        if self.allocation_strategy not in {"single_batch", "successive_halving"}:
+            raise ValueError("allocation_strategy must be 'single_batch' or 'successive_halving'")
+        if self.successive_halving_eta <= 1:
+            raise ValueError("successive_halving_eta must be greater than 1")
+        if self.successive_halving_min_batch_size < 0:
+            raise ValueError("successive_halving_min_batch_size must be non-negative")
+        if not 0.0 < self.successive_halving_promote_fraction <= 1.0:
+            raise ValueError("successive_halving_promote_fraction must be in (0, 1]")
+        if self.parent_selection_strategy not in {"uniform_top_k", "ucb", "thompson"}:
+            raise ValueError("parent_selection_strategy must be 'uniform_top_k', 'ucb', or 'thompson'")
+        if self.parent_ucb_exploration < 0:
+            raise ValueError("parent_ucb_exploration must be non-negative")
+        if self.operator_ucb_exploration < 0:
+            raise ValueError("operator_ucb_exploration must be non-negative")
 
 
 @dataclass(frozen=True)
 class SchemaEvoRunResult:
     baseline_result: CandidateEvalResult
+    promotion_baseline_result: CandidateEvalResult | None
     evaluated_records: tuple[CandidateRecord, ...]
     pareto_records: tuple[CandidateRecord, ...]
     final_records: tuple[CandidateRecord, ...]
     rejected_schemas: tuple[dict[str, Any], ...]
     operator_weights: dict[str, float]
+    operator_counts: dict[str, int]
+    budget_summary: dict[str, float | int | bool | None]
     artifacts: dict[str, str]
 
     def summary(self) -> dict[str, Any]:
         return {
             "baseline_mean": self.baseline_result.mean_score,
+            "promotion_baseline_mean": (
+                self.promotion_baseline_result.mean_score if self.promotion_baseline_result else None
+            ),
             "evaluated": len(self.evaluated_records),
             "pareto_size": len(self.pareto_records),
             "final_schema_ids": [record.schema.schema_id for record in self.final_records],
             "final_scores": [record.result.mean_score for record in self.final_records],
+            "final_stages": [record.stage for record in self.final_records],
             "rejected_schemas": len(self.rejected_schemas),
             "operator_weights": self.operator_weights,
+            "operator_counts": self.operator_counts,
+            "budget": self.budget_summary,
             "artifacts": self.artifacts,
         }
 
@@ -102,6 +140,17 @@ def schema_evo_optimize(
         seed=config.seed,
         stratify_key=stratify_key,
     )
+    stage_examples = _initial_allocation_examples(optimizer_examples, config=config)
+    cost_meter = _make_cost_meter(config)
+    budget = BudgetTracker(
+        BudgetLimits(
+            max_target_task_calls=config.max_target_task_calls,
+            max_prompt_tokens=config.max_prompt_tokens,
+            max_completion_tokens=config.max_completion_tokens,
+            max_total_tokens=config.max_total_tokens,
+            max_dollar_cost=config.max_dollar_cost,
+        )
+    )
 
     grammar = SchemaGrammar(
         allowed_modules=base_program.module_names,
@@ -110,7 +159,7 @@ def schema_evo_optimize(
     rng = random.Random(config.seed)
     baseline_result = evaluate_program(
         program=base_program,
-        examples=optimizer_examples,
+        examples=stage_examples,
         scorer=scorer,
         method="schemaevo_baseline",
         candidate_id="schemaevo_baseline",
@@ -118,9 +167,11 @@ def schema_evo_optimize(
         baseline_program=base_program,
         strict_invalid_policy=config.strict_invalid_policy,
         artifact_dir=artifact_root,
+        cost_meter=cost_meter,
         rollout_cache=rollout_cache,
         run_id="schemaevo_baseline",
     )
+    budget.record_result(baseline_result)
 
     population_schemas = _initialize_population(
         task=config.task,
@@ -136,16 +187,23 @@ def schema_evo_optimize(
     rejected: list[dict[str, Any]] = []
     schema_by_id: dict[str, SchemaCandidate] = {}
     operator_bandit: dict[str, float] = {}
+    operator_stats: dict[str, dict[str, float]] = {}
     rollouts_used = 0
     mutation_attempts = 0
+    search_rollout_limit = _search_rollout_limit(
+        total_rollouts=config.max_program_rollouts,
+        optimizer_examples=optimizer_examples,
+        stage_examples=stage_examples,
+        config=config,
+    )
 
     for schema in population_schemas:
-        if rollouts_used >= config.max_program_rollouts:
+        if rollouts_used >= search_rollout_limit or budget.exhausted:
             break
         record = _compile_and_eval(
             base_program=base_program,
             schema=schema,
-            examples=optimizer_examples,
+            examples=stage_examples,
             scorer=scorer,
             config=config,
             grammar=grammar,
@@ -155,6 +213,9 @@ def schema_evo_optimize(
             step=rollouts_used,
             baseline_cost=baseline_result.dollar_cost_per_example,
             mutation=None,
+            cost_meter=cost_meter,
+            budget=budget,
+            stage="initial",
         )
         if isinstance(record, dict):
             rejected.append(record)
@@ -165,17 +226,27 @@ def schema_evo_optimize(
         rollouts_used += 1
 
     mutation_rollout_limit = (
-        max(1, config.max_program_rollouts - 1)
+        max(1, search_rollout_limit - 1)
         if config.enable_schema_merge
-        else config.max_program_rollouts
+        else search_rollout_limit
     )
     while (
         rollouts_used < mutation_rollout_limit
         and mutation_attempts < config.max_mutation_attempts
         and evaluated
+        and not budget.exhausted
     ):
         mutation_attempts += 1
-        parent = _select_parent(evaluated, rng)
+        parent = _select_parent(
+            evaluated,
+            rng,
+            strategy=config.parent_selection_strategy,
+            exploration=config.parent_ucb_exploration,
+        )
+        operator_bandit = _operator_ucb_weights(
+            operator_stats,
+            exploration=config.operator_ucb_exploration,
+        )
         mutation = sample_schema_mutation(
             parent.schema,
             task=config.task,
@@ -207,7 +278,7 @@ def schema_evo_optimize(
         record = _compile_and_eval(
             base_program=base_program,
             schema=child_schema,
-            examples=optimizer_examples if config.shared_eval_batch else examples,
+            examples=stage_examples if config.shared_eval_batch else examples,
             scorer=scorer,
             config=config,
             grammar=grammar,
@@ -217,6 +288,9 @@ def schema_evo_optimize(
             step=rollouts_used,
             baseline_cost=baseline_result.dollar_cost_per_example,
             mutation=mutation,
+            cost_meter=cost_meter,
+            budget=budget,
+            stage="initial",
         )
         if isinstance(record, dict):
             rejected.append(record)
@@ -229,9 +303,14 @@ def schema_evo_optimize(
             mutation.op.value,
             reward=record.result.mean_score - parent.result.mean_score,
         )
+        _update_operator_stats(
+            operator_stats,
+            mutation.op.value,
+            reward=record.result.mean_score - parent.result.mean_score,
+        )
         rollouts_used += 1
 
-    if config.enable_schema_merge and rollouts_used < config.max_program_rollouts and len(pareto.records) >= 2:
+    if config.enable_schema_merge and rollouts_used < search_rollout_limit and len(pareto.records) >= 2:
         merged_schema = merge_schema_candidates(
             tuple(record.schema for record in pareto.top(2)),
             task=config.task,
@@ -242,7 +321,7 @@ def schema_evo_optimize(
             record = _compile_and_eval(
                 base_program=base_program,
                 schema=merged_schema,
-                examples=optimizer_examples,
+                examples=stage_examples,
                 scorer=scorer,
                 config=config,
                 grammar=grammar,
@@ -252,6 +331,9 @@ def schema_evo_optimize(
                 step=rollouts_used,
                 baseline_cost=baseline_result.dollar_cost_per_example,
                 mutation=None,
+                cost_meter=cost_meter,
+                budget=budget,
+                stage="initial_merge",
             )
             if isinstance(record, dict):
                 rejected.append({"schema_id": merged_schema.schema_id, **record})
@@ -261,7 +343,74 @@ def schema_evo_optimize(
                 schema_by_id[record.schema.schema_id] = record.schema
                 rollouts_used += 1
 
-    final_records = pareto.top(config.k_final)
+    promotion_baseline_result: CandidateEvalResult | None = None
+    final_pareto = pareto
+    if _should_promote(
+        optimizer_examples=optimizer_examples,
+        stage_examples=stage_examples,
+        config=config,
+    ) and evaluated and rollouts_used < config.max_program_rollouts and not budget.exhausted:
+        promotions = _select_promotions(
+            evaluated,
+            remaining_rollouts=config.max_program_rollouts - rollouts_used,
+            config=config,
+        )
+        if promotions:
+            promotion_baseline_result = evaluate_program(
+                program=base_program,
+                examples=optimizer_examples,
+                scorer=scorer,
+                method="schemaevo_promotion_baseline",
+                candidate_id="schemaevo_promotion_baseline",
+                seed=config.seed + 10_000,
+                baseline_program=base_program,
+                strict_invalid_policy=config.strict_invalid_policy,
+                artifact_dir=artifact_root,
+                cost_meter=cost_meter,
+                rollout_cache=rollout_cache,
+                run_id="schemaevo_promotion_baseline",
+            )
+            budget.record_result(promotion_baseline_result)
+            promoted_pareto = ParetoFront()
+            for source_record in promotions:
+                if rollouts_used >= config.max_program_rollouts or budget.exhausted:
+                    break
+                promoted = _compile_and_eval(
+                    base_program=base_program,
+                    schema=source_record.schema,
+                    examples=optimizer_examples,
+                    scorer=scorer,
+                    config=config,
+                    grammar=grammar,
+                    stratify_key=stratify_key,
+                    artifact_root=artifact_root,
+                    rollout_cache=rollout_cache,
+                    step=rollouts_used,
+                    baseline_cost=promotion_baseline_result.dollar_cost_per_example,
+                    mutation=source_record.mutation,
+                    cost_meter=cost_meter,
+                    budget=budget,
+                    stage="promotion",
+                )
+                if isinstance(promoted, dict):
+                    rejected.append(promoted)
+                    continue
+                evaluated.append(promoted)
+                promoted_pareto.update(promoted)
+                rollouts_used += 1
+            if promoted_pareto.records:
+                final_pareto = promoted_pareto
+
+    operator_bandit = _operator_ucb_weights(
+        operator_stats,
+        exploration=config.operator_ucb_exploration,
+    )
+    operator_counts = {
+        operator: int(stats.get("count", 0))
+        for operator, stats in operator_stats.items()
+    }
+    budget_summary = budget.summary()
+    final_records = final_pareto.top(config.k_final)
     artifacts: dict[str, str] = {}
     if artifact_root:
         summary_path = write_json(
@@ -269,12 +418,18 @@ def schema_evo_optimize(
                 "config": asdict(config),
                 "summary": {
                     "baseline_mean": baseline_result.mean_score,
+                    "promotion_baseline_mean": (
+                        promotion_baseline_result.mean_score if promotion_baseline_result else None
+                    ),
                     "evaluated": len(evaluated),
                     "mutation_attempts": mutation_attempts,
-                    "pareto_size": len(pareto.records),
+                    "pareto_size": len(final_pareto.records),
                     "final_schema_ids": [record.schema.schema_id for record in final_records],
+                    "final_stages": [record.stage for record in final_records],
                     "rejected_schemas": rejected,
                     "operator_weights": operator_bandit,
+                    "operator_counts": operator_counts,
+                    "budget": budget_summary,
                 },
             },
             artifact_root / "results" / "schemaevo_summary.json",
@@ -283,11 +438,14 @@ def schema_evo_optimize(
 
     return SchemaEvoRunResult(
         baseline_result=baseline_result,
+        promotion_baseline_result=promotion_baseline_result,
         evaluated_records=tuple(evaluated),
-        pareto_records=pareto.records,
+        pareto_records=final_pareto.records,
         final_records=final_records,
         rejected_schemas=tuple(rejected),
         operator_weights=dict(operator_bandit),
+        operator_counts=operator_counts,
+        budget_summary=budget_summary,
         artifacts=artifacts,
     )
 
@@ -515,6 +673,109 @@ def _update_operator_bandit(
     weights[operator] = (1.0 - learning_rate) * current + learning_rate * target
 
 
+def _update_operator_stats(
+    stats: dict[str, dict[str, float]],
+    operator: str,
+    *,
+    reward: float,
+) -> None:
+    entry = stats.setdefault(operator, {"count": 0.0, "mean_reward": 0.0})
+    count = entry["count"] + 1.0
+    mean = entry["mean_reward"] + (reward - entry["mean_reward"]) / count
+    entry["count"] = count
+    entry["mean_reward"] = mean
+
+
+def _operator_ucb_weights(
+    stats: dict[str, dict[str, float]],
+    *,
+    exploration: float,
+) -> dict[str, float]:
+    if not stats:
+        return {}
+    total = sum(entry.get("count", 0.0) for entry in stats.values())
+    weights: dict[str, float] = {}
+    for operator, entry in stats.items():
+        count = max(1.0, entry.get("count", 0.0))
+        mean_reward = entry.get("mean_reward", 0.0)
+        bonus = exploration * (max(0.0, total) + 1.0) ** 0.5 / count
+        weights[operator] = max(0.05, 1.0 + mean_reward + bonus)
+    return weights
+
+
+def _initial_allocation_examples(
+    examples: tuple[ProgramExample, ...],
+    *,
+    config: SchemaEvoConfig,
+) -> tuple[ProgramExample, ...]:
+    if config.allocation_strategy != "successive_halving" or len(examples) <= 1:
+        return examples
+    size = config.successive_halving_min_batch_size
+    if size <= 0:
+        size = max(1, len(examples) // config.successive_halving_eta)
+    return examples[: min(len(examples), size)]
+
+
+def _should_promote(
+    *,
+    optimizer_examples: tuple[ProgramExample, ...],
+    stage_examples: tuple[ProgramExample, ...],
+    config: SchemaEvoConfig,
+) -> bool:
+    return (
+        config.allocation_strategy == "successive_halving"
+        and len(stage_examples) < len(optimizer_examples)
+    )
+
+
+def _search_rollout_limit(
+    *,
+    total_rollouts: int,
+    optimizer_examples: tuple[ProgramExample, ...],
+    stage_examples: tuple[ProgramExample, ...],
+    config: SchemaEvoConfig,
+) -> int:
+    if not _should_promote(
+        optimizer_examples=optimizer_examples,
+        stage_examples=stage_examples,
+        config=config,
+    ):
+        return total_rollouts
+    reserve = max(1, int(total_rollouts * config.successive_halving_promote_fraction))
+    return max(1, total_rollouts - reserve)
+
+
+def _select_promotions(
+    records: list[CandidateRecord],
+    *,
+    remaining_rollouts: int,
+    config: SchemaEvoConfig,
+) -> tuple[CandidateRecord, ...]:
+    if remaining_rollouts <= 0:
+        return ()
+    promote_count = max(1, int(len(records) * config.successive_halving_promote_fraction))
+    promote_count = min(remaining_rollouts, promote_count, len(records))
+    return tuple(
+        sorted(
+            records,
+            key=lambda record: (
+                schema_selection_value(record.result, use_field_bonus=True),
+                record.result.mean_score,
+                -record.result.invalid_output_rate,
+                record.schema.schema_id,
+            ),
+            reverse=True,
+        )[:promote_count]
+    )
+
+
+def _make_cost_meter(config: SchemaEvoConfig) -> CostMeter:
+    return make_cost_meter(
+        model_prices=config.model_prices,
+        use_tiktoken=config.use_tiktoken_costing,
+    )
+
+
 def _initialize_population(
     *,
     task: str,
@@ -632,6 +893,9 @@ def _compile_and_eval(
     step: int,
     baseline_cost: float,
     mutation: Mutation | None,
+    cost_meter: CostMeter,
+    budget: BudgetTracker,
+    stage: str,
 ) -> CandidateRecord | dict[str, Any]:
     check = grammar.check_candidate(schema)
     if config.min_static_checks and not check.passed:
@@ -658,6 +922,15 @@ def _compile_and_eval(
             stratify_key=stratify_key,
         )
     )
+    min_calls = len(batch) * program.calls_per_example
+    if not budget.can_start(min_target_task_calls=min_calls):
+        return {
+            "schema_id": schema.schema_id,
+            "mutation": mutation.op.value if mutation else None,
+            "reason": "budget_exhausted",
+            "stage": stage,
+            "budget": budget.summary(),
+        }
     result = evaluate_program(
         program=program,
         examples=batch,
@@ -668,25 +941,51 @@ def _compile_and_eval(
         baseline_program=base_program,
         strict_invalid_policy=config.strict_invalid_policy,
         artifact_dir=artifact_root,
+        cost_meter=cost_meter,
         rollout_cache=rollout_cache,
         schema_generation_calls=1 if mutation else 0,
-        run_id=f"schemaevo_step_{step}_{schema.schema_id}",
+        run_id=f"schemaevo_step_{step}_{stage}_{schema.schema_id}",
     )
     result.baseline_dollar_cost_per_example = baseline_cost
-    return CandidateRecord(schema=schema, program=program, result=result, mutation=mutation)
+    budget.record_result(result)
+    return CandidateRecord(schema=schema, program=program, result=result, mutation=mutation, stage=stage)
 
 
-def _select_parent(records: list[CandidateRecord], rng: random.Random) -> CandidateRecord:
+def _select_parent(
+    records: list[CandidateRecord],
+    rng: random.Random,
+    *,
+    strategy: str,
+    exploration: float,
+) -> CandidateRecord:
     ranked = sorted(
         records,
         key=lambda record: (
-            schema_selection_value(record.result, use_field_bonus=True),
+            _parent_selection_score(record, strategy=strategy, exploration=exploration, rng=rng),
             record.schema.schema_id,
         ),
         reverse=True,
     )
-    top = ranked[: max(1, min(5, len(ranked)))]
-    return rng.choice(top)
+    if strategy == "uniform_top_k":
+        top = ranked[: max(1, min(5, len(ranked)))]
+        return rng.choice(top)
+    return ranked[0]
+
+
+def _parent_selection_score(
+    record: CandidateRecord,
+    *,
+    strategy: str,
+    exploration: float,
+    rng: random.Random,
+) -> float:
+    base = schema_selection_value(record.result, use_field_bonus=True)
+    uncertainty = max(0.0, record.result.score_ci_high - record.result.score_ci_low)
+    if strategy == "ucb":
+        return base + exploration * uncertainty
+    if strategy == "thompson":
+        return rng.gauss(record.result.mean_score, max(uncertainty / 4.0, 1e-6))
+    return base
 
 
 def _missing_template_fields(

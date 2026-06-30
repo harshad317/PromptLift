@@ -274,10 +274,12 @@ class LMProgram:
             )
             prompt_tokens_probe = prompt + str(module_input_snapshot)
             completion_tokens_probe = str(raw_output)
+            prompt_tokens = cost_meter.count_tokens(model=module.model, text=prompt_tokens_probe)
+            completion_tokens = cost_meter.count_tokens(model=module.model, text=completion_tokens_probe)
             dollar_cost = cost_meter.compute(
                 model=module.model,
-                prompt_tokens=max(1, len(prompt_tokens_probe) // 4),
-                completion_tokens=max(1, len(completion_tokens_probe) // 4),
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
             )
             log = make_module_log(
                 context=context,
@@ -286,6 +288,8 @@ class LMProgram:
                 module_output=raw_output,
                 latency_start=latency_start,
                 cost=dollar_cost,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
             )
             log_sink.write(log)
             logs.append(log)

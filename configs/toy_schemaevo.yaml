@@ -13,6 +13,8 @@ fixed_pool:
   freeze_prompt_text: true
   allow_only_schema_contract_insert: true
   strict_invalid_policy: true
+  reflection_rounds: 1
+  reflection_schemas_per_round: 0
 smoke_examples: 4
 selection_examples: 12
 confirmation_examples: 20
@@ -34,4 +36,11 @@ closed_loop:
   freeze_prompt_text: true
   allow_prompt_mutation: false
   strict_invalid_policy: true
+  allocation_strategy: successive_halving
+  successive_halving_min_batch_size: 4
+  successive_halving_promote_fraction: 0.4
+  parent_selection_strategy: ucb
+  parent_ucb_exploration: 0.25
+  operator_ucb_exploration: 0.4
+  use_tiktoken_costing: false
 closed_loop_examples: 24

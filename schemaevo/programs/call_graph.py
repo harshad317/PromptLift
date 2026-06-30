@@ -10,6 +10,7 @@ class CallGraph:
     modules: tuple[str, ...]
     llm_calls_by_module: tuple[tuple[str, int], ...]
     retriever_calls_by_module: tuple[tuple[str, int], ...]
+    demo_ids_by_module: tuple[tuple[str, tuple[str, ...]], ...]
     edges: tuple[tuple[str, str], ...]
     retriever_top_k: int
 
@@ -21,6 +22,9 @@ def extract_call_graph(program: LMProgram) -> CallGraph:
         modules=modules,
         llm_calls_by_module=tuple((module.name, module.llm_calls) for module in program.modules),
         retriever_calls_by_module=tuple((module.name, module.retriever_calls) for module in program.modules),
+        demo_ids_by_module=tuple(
+            (module.name, _demo_ids(module.metadata)) for module in program.modules
+        ),
         edges=edges,
         retriever_top_k=program.retriever_top_k,
     )
@@ -48,3 +52,12 @@ def assert_same_call_graph(candidate: LMProgram, baseline: LMProgram) -> None:
         raise AssertionError(
             f"retriever top-k changed: {candidate.retriever_top_k} != {baseline.retriever_top_k}"
         )
+
+
+def _demo_ids(metadata: dict[str, object]) -> tuple[str, ...]:
+    raw_ids = metadata.get("demo_ids", metadata.get("few_shot_demo_ids", ()))
+    if isinstance(raw_ids, str):
+        return (raw_ids,)
+    if isinstance(raw_ids, (list, tuple)):
+        return tuple(str(item) for item in raw_ids)
+    return ()

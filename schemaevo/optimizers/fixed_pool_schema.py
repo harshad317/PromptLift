@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 from schemaevo.eval.cache import RolloutCache
+from schemaevo.eval.cost_ledger import CostMeter, make_cost_meter
 from schemaevo.eval.field_ablations import FieldAblationResult, run_field_use_ablations
 from schemaevo.eval.scoring import CandidateEvalResult, Scorer, evaluate_program
 from schemaevo.eval.stats import PairedComparison, benjamini_hochberg_adjust, compare_paired
@@ -37,6 +38,10 @@ class FixedPoolConfig:
     allow_only_schema_contract_insert: bool = True
     strict_invalid_policy: bool = True
     multiple_comparison_correction: str = "benjamini_hochberg"
+    reflection_rounds: int = 1
+    reflection_schemas_per_round: int = 0
+    use_tiktoken_costing: bool = False
+    model_prices: dict[str, dict[str, float | str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.n_trace_schemas < 0:
@@ -55,6 +60,10 @@ class FixedPoolConfig:
             raise ValueError("randomization_swaps must be positive")
         if self.multiple_comparison_correction not in {"benjamini_hochberg", "none"}:
             raise ValueError("multiple_comparison_correction must be 'benjamini_hochberg' or 'none'")
+        if self.reflection_rounds <= 0:
+            raise ValueError("reflection_rounds must be positive")
+        if self.reflection_schemas_per_round < 0:
+            raise ValueError("reflection_schemas_per_round must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -83,6 +92,7 @@ class FixedPoolResult:
     heldout_test_stats: PairedComparison | None
     field_ablation_results: tuple[FieldAblationResult, ...]
     decision: MVPDecision
+    reflection_rounds: tuple[dict[str, Any], ...]
     artifacts: dict[str, str]
 
     def summary(self) -> dict[str, Any]:
@@ -97,6 +107,7 @@ class FixedPoolResult:
             "score_delta": self.decision.score_delta,
             "invalid_output_rate": self.best_confirmation_result.invalid_output_rate,
             "field_ablations": [asdict(result) for result in self.field_ablation_results],
+            "reflection_rounds": self.reflection_rounds,
             "artifacts": self.artifacts,
         }
 
@@ -118,6 +129,10 @@ def run_fixed_pool_schema_mvp(
     if artifact_root:
         artifact_root.mkdir(parents=True, exist_ok=True)
     rollout_cache = RolloutCache(artifact_root / "rollout_cache" if artifact_root else None)
+    cost_meter = make_cost_meter(
+        model_prices=config.model_prices,
+        use_tiktoken=config.use_tiktoken_costing,
+    )
     _validate_examples_and_splits(
         train_traces=train_traces,
         smoke_examples=smoke_examples,
@@ -159,6 +174,7 @@ def run_fixed_pool_schema_mvp(
         baseline_program=base_program,
         strict_invalid_policy=config.strict_invalid_policy,
         artifact_dir=artifact_root,
+        cost_meter=cost_meter,
         rollout_cache=rollout_cache,
         run_id="fixed_schema_reference_selection",
     )
@@ -173,6 +189,7 @@ def run_fixed_pool_schema_mvp(
                 artifact_root=artifact_root,
                 method="schema_smoke",
                 baseline_cost=baseline_selection.dollar_cost_per_example,
+                cost_meter=cost_meter,
                 rollout_cache=rollout_cache,
             )
         )
@@ -203,9 +220,38 @@ def run_fixed_pool_schema_mvp(
             artifact_root=artifact_root,
             method="schema_selection",
             baseline_cost=baseline_selection.dollar_cost_per_example,
+            cost_meter=cost_meter,
             rollout_cache=rollout_cache,
         )
     )
+    reflection_rounds: tuple[dict[str, Any], ...] = ()
+    if config.reflection_rounds > 1 and proposer is not None:
+        (
+            schema_pool,
+            compiled_candidates,
+            smoke_results,
+            selection_results,
+            reflection_rounds,
+        ) = _run_reflection_rounds(
+            base_program=base_program,
+            schema_pool=schema_pool,
+            compiled_candidates=compiled_candidates,
+            smoke_results=smoke_results,
+            selection_results=selection_results,
+            train_like_examples=selection_examples,
+            smoke_examples=smoke_examples,
+            scorer=scorer,
+            config=config,
+            proposer=proposer,
+            grammar=grammar,
+            module_names=module_names,
+            artifact_root=artifact_root,
+            baseline_cost=baseline_selection.dollar_cost_per_example,
+            cost_meter=cost_meter,
+            rollout_cache=rollout_cache,
+        )
+        if artifact_root:
+            schema_pool_path = str(freeze_jsonl(schema_pool, artifact_root / "schemas" / "frozen_pool.jsonl"))
     top_selection_results = tuple(
         select_top_k_by_lcb(
             list(selection_results),
@@ -231,6 +277,7 @@ def run_fixed_pool_schema_mvp(
         baseline_program=base_program,
         strict_invalid_policy=config.strict_invalid_policy,
         artifact_dir=artifact_root,
+        cost_meter=cost_meter,
         rollout_cache=rollout_cache,
         run_id="fixed_schema_reference_confirmation",
     )
@@ -244,6 +291,7 @@ def run_fixed_pool_schema_mvp(
             artifact_root=artifact_root,
             method="schema_confirmation",
             baseline_cost=baseline_confirmation.dollar_cost_per_example,
+            cost_meter=cost_meter,
             rollout_cache=rollout_cache,
         )
     )
@@ -256,7 +304,7 @@ def run_fixed_pool_schema_mvp(
         confirmation_results,
         key=lambda result: (result.mean_score, -result.invalid_output_rate, result.schema_id),
     )
-    best_program = next(
+    primary_program = next(
         candidate
         for candidate in top_programs
         if candidate.schema_candidate and candidate.schema_candidate.schema_id == primary_confirmation.schema_id
@@ -287,11 +335,12 @@ def run_fixed_pool_schema_mvp(
             baseline_program=base_program,
             strict_invalid_policy=config.strict_invalid_policy,
             artifact_dir=artifact_root,
+            cost_meter=cost_meter,
             rollout_cache=rollout_cache,
             run_id="fixed_schema_reference_heldout_test",
         )
         heldout_test_result = evaluate_program(
-            program=best_program,
+            program=primary_program,
             examples=heldout_test_examples,
             scorer=scorer,
             method="schema_heldout_test",
@@ -300,6 +349,7 @@ def run_fixed_pool_schema_mvp(
             baseline_program=base_program,
             strict_invalid_policy=config.strict_invalid_policy,
             artifact_dir=artifact_root,
+            cost_meter=cost_meter,
             rollout_cache=rollout_cache,
             schema_generation_calls=0,
             run_id=f"schema_heldout_test_{primary_confirmation.schema_id}",
@@ -314,13 +364,14 @@ def run_fixed_pool_schema_mvp(
         )
     field_ablation_results = tuple(
         run_field_use_ablations(
-            program=best_program,
+            program=primary_program,
             examples=confirmation_examples,
             scorer=scorer,
             unablated_result=primary_confirmation,
-            fields=best_program.schema_candidate.evolved_field_names if best_program.schema_candidate else (),
+            fields=primary_program.schema_candidate.evolved_field_names if primary_program.schema_candidate else (),
             seed=config.seed,
             artifact_dir=artifact_root,
+            cost_meter=cost_meter,
         )
     )
     decision = _make_decision(
@@ -361,6 +412,7 @@ def run_fixed_pool_schema_mvp(
                 if heldout_test_stats
                 else None,
                 "field_ablation_results": [asdict(result) for result in field_ablation_results],
+                "reflection_rounds": list(reflection_rounds),
             },
             artifact_root / "results" / "mvp_summary.json",
         )
@@ -382,6 +434,7 @@ def run_fixed_pool_schema_mvp(
         heldout_test_stats=heldout_test_stats,
         field_ablation_results=field_ablation_results,
         decision=decision,
+        reflection_rounds=reflection_rounds,
         artifacts=artifacts,
     )
 
@@ -498,6 +551,7 @@ def _evaluate_many(
     artifact_root: Path | None,
     method: str,
     baseline_cost: float,
+    cost_meter: CostMeter,
     rollout_cache: RolloutCache,
 ) -> list[CandidateEvalResult]:
     results: list[CandidateEvalResult] = []
@@ -513,6 +567,7 @@ def _evaluate_many(
             baseline_program=base_program,
             strict_invalid_policy=config.strict_invalid_policy,
             artifact_dir=artifact_root,
+            cost_meter=cost_meter,
             rollout_cache=rollout_cache,
             schema_generation_calls=1,
             run_id=f"{method}_{schema_id}_{index}",
@@ -520,6 +575,232 @@ def _evaluate_many(
         result.baseline_dollar_cost_per_example = baseline_cost
         results.append(result)
     return results
+
+
+def _run_reflection_rounds(
+    *,
+    base_program: LMProgram,
+    schema_pool: tuple[SchemaCandidate, ...],
+    compiled_candidates: tuple[LMProgram, ...],
+    smoke_results: tuple[CandidateEvalResult, ...],
+    selection_results: tuple[CandidateEvalResult, ...],
+    train_like_examples: tuple[ProgramExample, ...],
+    smoke_examples: tuple[ProgramExample, ...],
+    scorer: Scorer,
+    config: FixedPoolConfig,
+    proposer: SchemaProposer,
+    grammar: SchemaGrammar,
+    module_names: tuple[str, ...],
+    artifact_root: Path | None,
+    baseline_cost: float,
+    cost_meter: CostMeter,
+    rollout_cache: RolloutCache,
+) -> tuple[
+    tuple[SchemaCandidate, ...],
+    tuple[LMProgram, ...],
+    tuple[CandidateEvalResult, ...],
+    tuple[CandidateEvalResult, ...],
+    tuple[dict[str, Any], ...],
+]:
+    metadata: list[dict[str, Any]] = []
+    if any(example.split != "train" for example in train_like_examples):
+        return (
+            schema_pool,
+            compiled_candidates,
+            smoke_results,
+            selection_results,
+            (
+                {
+                    "round": 1,
+                    "status": "skipped",
+                    "reason": "reflection requires train split examples",
+                },
+            ),
+        )
+
+    existing_schema_ids = {schema.schema_id for schema in schema_pool}
+    current_pool = list(schema_pool)
+    current_programs = list(compiled_candidates)
+    current_smoke = list(smoke_results)
+    current_selection = list(selection_results)
+    schemas_per_round = config.reflection_schemas_per_round or max(
+        1,
+        config.n_trace_schemas // max(1, config.reflection_rounds),
+    )
+
+    for round_index in range(1, config.reflection_rounds):
+        top = select_top_k_by_lcb(
+            list(current_selection),
+            k=1,
+            use_field_bonus=False,
+        )
+        if not top:
+            metadata.append({"round": round_index, "status": "skipped", "reason": "no selection results"})
+            break
+        primary = top[0]
+        failure_traces = _failure_traces_from_result(
+            result=primary,
+            examples=train_like_examples,
+            max_traces=max(1, schemas_per_round * 2),
+        )
+        if not failure_traces:
+            metadata.append(
+                {
+                    "round": round_index,
+                    "status": "skipped",
+                    "reason": "primary had no failing train traces",
+                    "primary_schema_id": primary.schema_id,
+                }
+            )
+            break
+        proposed = propose_schemas_from_traces(
+            traces=failure_traces,
+            task=config.task,
+            module_names=module_names,
+            n=schemas_per_round,
+            seed=config.seed + 10_000 + round_index,
+            schema_token_budget=config.schema_token_budget,
+            proposer=proposer,
+        )
+        filtered = [
+            schema
+            for schema in _static_filter(tuple(proposed), grammar)
+            if schema.schema_id not in existing_schema_ids
+        ]
+        if not filtered:
+            metadata.append(
+                {
+                    "round": round_index,
+                    "status": "skipped",
+                    "reason": "no new grammar-valid schemas",
+                    "primary_schema_id": primary.schema_id,
+                    "failure_traces": len(failure_traces),
+                }
+            )
+            continue
+        new_programs = tuple(
+            _compile_candidate(base_program=base_program, schema=schema, config=config)
+            for schema in filtered
+        )
+        new_smoke = (
+            tuple(
+                _evaluate_many(
+                    candidates=new_programs,
+                    examples=smoke_examples,
+                    scorer=scorer,
+                    config=config,
+                    base_program=base_program,
+                    artifact_root=artifact_root,
+                    method=f"schema_reflection_{round_index}_smoke",
+                    baseline_cost=baseline_cost,
+                    cost_meter=cost_meter,
+                    rollout_cache=rollout_cache,
+                )
+            )
+            if smoke_examples
+            else ()
+        )
+        smoke_pass = {
+            result.schema_id
+            for result in new_smoke
+            if 1.0 - result.invalid_output_rate >= config.min_smoke_validity
+        }
+        if new_smoke:
+            new_programs = tuple(
+                program
+                for program in new_programs
+                if program.schema_candidate and program.schema_candidate.schema_id in smoke_pass
+            )
+        if not new_programs:
+            current_smoke.extend(new_smoke)
+            metadata.append(
+                {
+                    "round": round_index,
+                    "status": "skipped",
+                    "reason": "no reflected schemas survived smoke",
+                    "primary_schema_id": primary.schema_id,
+                    "proposed": len(filtered),
+                }
+            )
+            continue
+        new_schema_ids = {
+            program.schema_candidate.schema_id
+            for program in new_programs
+            if program.schema_candidate
+        }
+        current_pool.extend(schema for schema in filtered if schema.schema_id in new_schema_ids)
+        current_programs.extend(new_programs)
+        current_smoke.extend(new_smoke)
+        new_selection = tuple(
+            _evaluate_many(
+                candidates=new_programs,
+                examples=train_like_examples,
+                scorer=scorer,
+                config=config,
+                base_program=base_program,
+                artifact_root=artifact_root,
+                method=f"schema_reflection_{round_index}_selection",
+                baseline_cost=baseline_cost,
+                cost_meter=cost_meter,
+                rollout_cache=rollout_cache,
+            )
+        )
+        current_selection.extend(new_selection)
+        existing_schema_ids.update(new_schema_ids)
+        metadata.append(
+            {
+                "round": round_index,
+                "status": "evaluated",
+                "primary_schema_id": primary.schema_id,
+                "failure_traces": len(failure_traces),
+                "proposed": len(filtered),
+                "survived_smoke": len(new_programs),
+                "selection_results": len(new_selection),
+            }
+        )
+
+    return (
+        tuple(current_pool),
+        tuple(current_programs),
+        tuple(current_smoke),
+        tuple(current_selection),
+        tuple(metadata),
+    )
+
+
+def _failure_traces_from_result(
+    *,
+    result: CandidateEvalResult,
+    examples: tuple[ProgramExample, ...],
+    max_traces: int,
+) -> tuple[TraceExample, ...]:
+    by_id = {example.example_id: example for example in examples}
+    traces: list[TraceExample] = []
+    for prediction, score in zip(result.predictions, result.per_example_scores):
+        if score >= 1.0 and prediction.valid:
+            continue
+        example = by_id.get(prediction.example_id)
+        if example is None:
+            continue
+        traces.append(
+            TraceExample(
+                example_id=example.example_id,
+                split=example.split,
+                module_name=prediction.schema_id,
+                input_summary=str(example.inputs)[:512],
+                output_summary=str(prediction.final_output)[:512],
+                score=score,
+                errors=tuple(prediction.validation_errors) or ("low_task_score",),
+                metadata={
+                    "source": "schemaevo_reflection",
+                    "schema_id": result.schema_id,
+                    "candidate_id": result.candidate_id,
+                },
+            )
+        )
+        if len(traces) >= max_traces:
+            break
+    return tuple(traces)
 
 
 def _corrected_confirmation_stats(

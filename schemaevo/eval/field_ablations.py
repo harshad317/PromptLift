@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from schemaevo.eval.cost_ledger import CostMeter
 from schemaevo.eval.scoring import CandidateEvalResult, Scorer, evaluate_program
 from schemaevo.programs.base import FieldIntervention, LMProgram, ProgramExample
 
@@ -105,6 +106,7 @@ def run_field_use_ablations(
     fields: tuple[str, ...],
     seed: int,
     artifact_dir: str | Path | None = None,
+    cost_meter: CostMeter | None = None,
 ) -> list[FieldAblationResult]:
     results: list[FieldAblationResult] = []
     consumer_modules = _consumer_modules(program)
@@ -127,6 +129,7 @@ def run_field_use_ablations(
                 scorer=scorer,
                 seed=seed,
                 artifact_dir=artifact_dir,
+                cost_meter=cost_meter,
                 intervention=intervention,
                 method=f"field_{ablation}",
                 field_name=field_name,
@@ -148,6 +151,7 @@ def run_field_use_ablations(
             scorer=scorer,
             seed=seed,
             artifact_dir=artifact_dir,
+            cost_meter=cost_meter,
             intervention=DownstreamConsumptionDisabledIntervention(consumer_modules=consumer_modules),
             method="field_downstream_disabled",
             field_name="__all__",
@@ -172,6 +176,7 @@ def _eval_intervention(
     scorer: Scorer,
     seed: int,
     artifact_dir: str | Path | None,
+    cost_meter: CostMeter | None,
     intervention: FieldIntervention,
     method: str,
     field_name: str,
@@ -186,6 +191,7 @@ def _eval_intervention(
         baseline_program=None,
         field_intervention=intervention,
         artifact_dir=artifact_dir,
+        cost_meter=cost_meter,
         run_id=f"{method}_{field_name}",
     )
 
