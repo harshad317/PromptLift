@@ -4,6 +4,16 @@ Fixed-call schema evolution for multi-module LLM prompt programs.
 
 This repository implements the prompt-optimization method from the supplied implementation plan: evolve typed intermediate schema contracts, validators, and downstream consumption rules while preserving the deployment call graph.
 
+## Visual Overview
+
+SchemaEvo changes the typed intermediate contracts between existing program modules. The optimizer can improve what modules emit and consume, but it does not add LLM calls, retrieval calls, tools, demos, or test-label access.
+
+![SchemaEvo fixed-call architecture](docs/images/schemaevo-architecture.svg)
+
+The fixed-pool path evaluates a frozen set of schema candidates. The closed-loop path keeps the same deployment boundary, then searches with legal mutations, shared minibatches, budget gates, and Pareto tracking.
+
+![SchemaEvo optimizer loop](docs/images/schemaevo-loop.svg)
+
 ## Scope
 
 Implemented:
