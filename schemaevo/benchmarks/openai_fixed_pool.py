@@ -7,7 +7,7 @@ from typing import Any, Literal
 from schemaevo.adapters.openai import OpenAIModuleConfig, openai_modules_to_lm_program
 from schemaevo.datasets.hotpotqa import load_hotpotqa_examples
 from schemaevo.datasets.hover import load_hover_examples
-from schemaevo.datasets.scorers import hotpotqa_exact_match, hover_label_accuracy
+from schemaevo.datasets.scorers import hotpotqa_exact_match, hotpotqa_f1, hover_label_accuracy
 from schemaevo.eval.scoring import Scorer
 from schemaevo.optimizers.fixed_pool_schema import FixedPoolConfig, FixedPoolResult, run_fixed_pool_schema_mvp
 from schemaevo.programs.base import LMProgram, ProgramExample
@@ -113,8 +113,10 @@ def build_openai_benchmark_program(
                 output_fields=("plan_summary",),
                 output_field_types={"plan_summary": "string"},
                 prompt=(
-                    "Plan the multi-hop reasoning needed to answer the question from the provided context. "
-                    "Return JSON only."
+                    "Read the context and write a concise plan_summary capturing the specific facts "
+                    "needed to answer the question: the key entities, dates, numbers, and relationships, "
+                    "including the bridge fact that links the hops. The downstream answerer will NOT see "
+                    "the source documents, so include every fact required to answer. Return JSON only."
                 ),
                 model=config.model,
                 max_output_tokens=512,
@@ -122,13 +124,19 @@ def build_openai_benchmark_program(
                 retriever_calls=1 if config.retriever_top_k else 0,
             ),
             OpenAIModuleConfig(
+                # Interface-bottleneck setup: the answerer does NOT see raw context.
+                # It must rely on what the planner distilled (plan_summary + SchemaEvo fields),
+                # so the planner->answerer schema is the only information channel.
                 name="answerer",
-                input_fields=("question", "context", "plan_summary"),
+                input_fields=("question", "plan_summary"),
                 output_fields=("answer", "confidence"),
                 output_field_types={"answer": "string", "confidence": "number"},
                 prompt=(
-                    "Answer the HotpotQA question using the context, plan, and any SchemaEvo fields. "
-                    "Return JSON with answer and confidence."
+                    "Answer the HotpotQA question using ONLY the planner's plan and any SchemaEvo fields. "
+                    "You do not have the source documents; rely on the distilled plan/evidence provided. "
+                    "Give the shortest exact answer span only - a name, entity, number, or 'yes'/'no'. "
+                    "Do not write a sentence or any explanation. "
+                    "Return JSON with answer (the span) and confidence."
                 ),
                 model=config.model,
                 max_output_tokens=256,
@@ -246,7 +254,7 @@ def _load_examples(
 
 def _scorer_for_dataset(dataset: DatasetName) -> Scorer:
     if dataset == "hotpotqa":
-        return hotpotqa_exact_match
+        return hotpotqa_f1
     if dataset == "hover":
         return hover_label_accuracy
     raise ValueError(f"unsupported dataset: {dataset}")
