@@ -4,11 +4,20 @@ from dataclasses import asdict, dataclass, field
 import importlib.util
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 from schemaevo.datasets.hotpotqa import load_hotpotqa_examples
 from schemaevo.datasets.hover import load_hover_examples
+from schemaevo.datasets.musique import load_musique_examples
 from schemaevo.programs.base import ProgramExample
+
+
+_DATASET_PATH_ALIASES: dict[str, tuple[str, ...]] = {
+    "hotpotqa": ("hotpotqa", "hotpot"),
+    "hover": ("hover",),
+    "musique": ("musique",),
+}
 
 
 @dataclass(frozen=True)
@@ -29,6 +38,7 @@ def check_benchmark_readiness(
     *,
     hotpotqa_path: str | Path | None = None,
     hover_path: str | Path | None = None,
+    musique_path: str | Path | None = None,
     require_context: bool = True,
     inspect_limit: int = 200,
 ) -> BenchmarkReadiness:
@@ -59,8 +69,17 @@ def check_benchmark_readiness(
         )
         if not datasets["hover"]["ok"]:
             reasons.append(f"HoVer data unavailable: {datasets['hover']['reason']}")
-    if hotpotqa_path is None and hover_path is None:
-        reasons.append("no HotpotQA or HoVer data path was provided")
+    if musique_path is not None:
+        datasets["musique"] = _check_dataset(
+            path=musique_path,
+            loader=lambda path: load_musique_examples(path, split="readiness", limit=inspect_limit),
+            dataset="musique",
+            require_context=require_context,
+        )
+        if not datasets["musique"]["ok"]:
+            reasons.append(f"MuSiQue data unavailable: {datasets['musique']['reason']}")
+    if hotpotqa_path is None and hover_path is None and musique_path is None:
+        reasons.append("no HotpotQA, HoVer, or MuSiQue data path was provided")
 
     ready = not reasons
     return BenchmarkReadiness(
@@ -100,6 +119,7 @@ def check_fixed_pool_split_readiness(
         ("confirmation", confirmation_path, "validation_confirmation"),
         ("heldout", heldout_path, "final_test"),
     )
+    reasons.extend(_dataset_path_mismatch_errors(dataset=dataset, split_specs=split_specs))
     examples_by_label: dict[str, tuple[ProgramExample, ...]] = {}
     for label, path, runtime_split in split_specs:
         if path is None:
@@ -154,6 +174,8 @@ def _loader_for_dataset(*, dataset: str, runtime_split: str, inspect_limit: int)
         return lambda path: load_hotpotqa_examples(path, split=runtime_split, limit=inspect_limit)
     if dataset == "hover":
         return lambda path: load_hover_examples(path, split=runtime_split, limit=inspect_limit)
+    if dataset == "musique":
+        return lambda path: load_musique_examples(path, split=runtime_split, limit=inspect_limit)
     raise ValueError(f"unsupported dataset: {dataset}")
 
 
@@ -162,6 +184,8 @@ def _dataset_label(dataset: str) -> str:
         return "HotpotQA"
     if dataset == "hover":
         return "HoVer"
+    if dataset == "musique":
+        return "MuSiQue"
     return dataset
 
 
@@ -250,7 +274,7 @@ def _quality_metrics(
     duplicate_ids = len(ids) - len(set(ids))
     context_nonempty = sum(1 for example in examples if _has_context(example.inputs.get("context")))
     question_nonempty = sum(1 for example in examples if example.inputs.get("question") or example.inputs.get("claim"))
-    if dataset == "hotpotqa":
+    if dataset in {"hotpotqa", "musique"}:
         target_nonempty = sum(1 for example in examples if example.expected.get("answer"))
     elif dataset == "hover":
         target_nonempty = sum(1 for example in examples if example.expected.get("label"))
@@ -279,7 +303,7 @@ def _quality_errors(
         errors.append("missing question/claim fields")
     if quality.get("target_coverage", 0.0) < 1.0:
         errors.append("missing answer/label targets")
-    if require_context and dataset in {"hotpotqa", "hover"} and quality.get("context_coverage", 0.0) < 1.0:
+    if require_context and dataset in {"hotpotqa", "hover", "musique"} and quality.get("context_coverage", 0.0) < 1.0:
         errors.append(
             f"context coverage {quality.get('context_coverage', 0.0):.3f} < 1.0; "
             "this is not a full context benchmark file"
@@ -301,3 +325,40 @@ def _has_context(value: Any) -> bool:
 
 def _ratio(numerator: int, denominator: int) -> float:
     return numerator / denominator if denominator else 0.0
+
+
+def _dataset_path_mismatch_errors(
+    *,
+    dataset: str,
+    split_specs: tuple[tuple[str, str | Path | None, str], ...],
+) -> list[str]:
+    errors: list[str] = []
+    declared_aliases = set(_DATASET_PATH_ALIASES.get(dataset, (dataset,)))
+    other_aliases = {
+        other_dataset: aliases
+        for other_dataset, aliases in _DATASET_PATH_ALIASES.items()
+        if other_dataset != dataset
+    }
+    for label, path, _runtime_split in split_specs:
+        if path is None:
+            continue
+        tokens = _path_tokens(Path(path))
+        if tokens & declared_aliases:
+            continue
+        for other_dataset, aliases in other_aliases.items():
+            matched = tokens & set(aliases)
+            if matched:
+                errors.append(
+                    f"dataset flag is {_dataset_label(dataset)} but {label} path appears to be "
+                    f"{_dataset_label(other_dataset)}: {path}; use --dataset {other_dataset} "
+                    "or move the file under a path matching the declared dataset"
+                )
+                break
+    return errors
+
+
+def _path_tokens(path: Path) -> set[str]:
+    tokens: set[str] = set()
+    for part in path.parts:
+        tokens.update(token for token in re.split(r"[^a-z0-9]+", part.lower()) if token)
+    return tokens

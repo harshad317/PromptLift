@@ -1,0 +1,34 @@
+fixed_pool:
+  task: MuSiQue
+  target_model: gpt-4.1-mini
+  seed: 0
+  n_trace_schemas: 20
+  n_random_schemas: 5
+  schema_token_budget: 512
+  min_smoke_validity: 0.95
+  top_k_confirmation: 5
+  min_confirmation_delta: 0.02
+  bootstrap_resamples: 2000
+  randomization_swaps: 2000
+  freeze_prompt_text: true
+  allow_only_schema_contract_insert: true
+  strict_invalid_policy: true
+  multiple_comparison_correction: benjamini_hochberg
+  reflection_rounds: 2
+  reflection_schemas_per_round: 5
+  use_tiktoken_costing: true
+  max_dollar_cost: 8.0
+  workers: 2
+  progress: auto
+train_examples: 40
+smoke_examples: 0
+selection_examples: 40
+confirmation_examples: 80
+heldout_test_examples: 0
+retriever_top_k: 0
+proposer:
+  kind: openai
+  model: gpt-4.1-mini
+  temperature: 0.7
+  target_temperature: 0
+  max_output_tokens: 4096

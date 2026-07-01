@@ -19,9 +19,10 @@ from schemaevo.benchmarks.openai_fixed_pool import (
     run_openai_fixed_pool_benchmark,
 )
 from schemaevo.benchmarks.readiness import check_benchmark_readiness, check_fixed_pool_split_readiness
-from schemaevo.datasets.scorers import hotpotqa_exact_match, hover_label_accuracy
+from schemaevo.datasets.scorers import hotpotqa_exact_match, hover_label_accuracy, musique_exact_match
 from schemaevo.datasets.hotpotqa import load_hotpotqa_examples
 from schemaevo.datasets.hover import load_hover_examples
+from schemaevo.datasets.musique import load_musique_examples
 from schemaevo.examples.toy_multihop import (
     build_toy_program,
     make_toy_examples,
@@ -39,9 +40,12 @@ from schemaevo.optimizers.schema_evo import SchemaEvoConfig, schema_evo_optimize
 from schemaevo.schemas.proposer import HeuristicTraceSchemaProposer, OpenAISchemaProposer, SchemaProposer
 
 
+_DATASET_CHOICES = ("hotpotqa", "hover", "musique")
+
+
 def _add_fixed_pool_data_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", default="configs/toy_schemaevo.yaml")
-    parser.add_argument("--dataset", choices=("hotpotqa", "hover"), required=True)
+    parser.add_argument("--dataset", choices=_DATASET_CHOICES, required=True)
     parser.add_argument("--train", required=True)
     parser.add_argument("--selection", required=True)
     parser.add_argument("--confirmation", required=True)
@@ -99,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     readiness.add_argument("--hotpotqa", default=None, help="Path to local HotpotQA JSON/JSONL data.")
     readiness.add_argument("--hover", default=None, help="Path to local HoVer JSON/JSONL data.")
+    readiness.add_argument("--musique", default=None, help="Path to local MuSiQue JSON/JSONL data.")
     readiness.add_argument("--strict", action="store_true", help="Exit nonzero when readiness fails.")
     readiness.add_argument(
         "--allow-contextless",
@@ -109,10 +114,10 @@ def main(argv: list[str] | None = None) -> int:
 
     real_fixed = subparsers.add_parser(
         "run-openai-fixed-pool",
-        help="Run fixed-pool SchemaEvo on local HotpotQA/HoVer files with OpenAI module runners.",
+        help="Run fixed-pool SchemaEvo on local HotpotQA/HoVer/MuSiQue files with OpenAI module runners.",
     )
     real_fixed.add_argument("--config", default="configs/toy_schemaevo.yaml")
-    real_fixed.add_argument("--dataset", choices=("hotpotqa", "hover"), required=True)
+    real_fixed.add_argument("--dataset", choices=_DATASET_CHOICES, required=True)
     real_fixed.add_argument("--train", required=True)
     real_fixed.add_argument("--selection", required=True)
     real_fixed.add_argument("--confirmation", required=True)
@@ -211,10 +216,10 @@ def main(argv: list[str] | None = None) -> int:
 
     closed_real = subparsers.add_parser(
         "run-openai-closed-loop",
-        help="Run closed-loop SchemaEvo on local HotpotQA/HoVer files with OpenAI module runners.",
+        help="Run closed-loop SchemaEvo on local HotpotQA/HoVer/MuSiQue files with OpenAI module runners.",
     )
     closed_real.add_argument("--config", default="configs/toy_schemaevo.yaml")
-    closed_real.add_argument("--dataset", choices=("hotpotqa", "hover"), required=True)
+    closed_real.add_argument("--dataset", choices=_DATASET_CHOICES, required=True)
     closed_real.add_argument("--optimizer", required=True)
     closed_real.add_argument("--confirmation", required=True)
     closed_real.add_argument("--heldout", default=None)
@@ -232,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Run external GEPA/MIPRO-style prompt optimizer, then SchemaEvo, then additive evaluation.",
     )
     composability.add_argument("--config", default="configs/toy_schemaevo.yaml")
-    composability.add_argument("--dataset", choices=("hotpotqa", "hover"), required=True)
+    composability.add_argument("--dataset", choices=_DATASET_CHOICES, required=True)
     composability.add_argument("--schema-optimizer", required=True)
     composability.add_argument("--eval", required=True)
     composability.add_argument("--out", default="artifacts/openai_composability")
@@ -280,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
         return _check_benchmark_readiness(
             hotpotqa_path=args.hotpotqa,
             hover_path=args.hover,
+            musique_path=args.musique,
             strict=bool(args.strict),
             require_context=not bool(args.allow_contextless),
             inspect_limit=int(args.inspect_limit),
@@ -478,6 +484,7 @@ def _check_benchmark_readiness(
     *,
     hotpotqa_path: str | None,
     hover_path: str | None,
+    musique_path: str | None,
     strict: bool,
     require_context: bool = True,
     inspect_limit: int = 200,
@@ -485,6 +492,7 @@ def _check_benchmark_readiness(
     readiness = check_benchmark_readiness(
         hotpotqa_path=hotpotqa_path,
         hover_path=hover_path,
+        musique_path=musique_path,
         require_context=require_context,
         inspect_limit=inspect_limit,
     )
@@ -599,7 +607,7 @@ def _prepare_openai_fixed_pool_run(
     selected_model = model or proposer_config.get("model") or fixed_pool_config.target_model
     fixed_pool_config = replace(
         fixed_pool_config,
-        task="HotpotQA" if dataset == "hotpotqa" else "HoVer",
+        task=_task_label(dataset),
         target_model=str(selected_model),
         use_tiktoken_costing=bool(use_tiktoken_costing or fixed_pool_config.use_tiktoken_costing),
     )
@@ -772,7 +780,7 @@ def _run_openai_closed_loop(
     schema_config = SchemaEvoConfig(**raw.get("closed_loop", raw.get("schema_evo", {})))
     schema_config = replace(
         schema_config,
-        task="HotpotQA" if dataset == "hotpotqa" else "HoVer",
+        task=_task_label(dataset),
         use_tiktoken_costing=bool(use_tiktoken_costing or schema_config.use_tiktoken_costing),
         progress=progress or schema_config.progress,
     )
@@ -826,7 +834,7 @@ def _run_openai_composability(
     schema_config = SchemaEvoConfig(**raw.get("closed_loop", raw.get("schema_evo", {})))
     schema_config = replace(
         schema_config,
-        task="HotpotQA" if dataset == "hotpotqa" else "HoVer",
+        task=_task_label(dataset),
         use_tiktoken_costing=bool(use_tiktoken_costing or schema_config.use_tiktoken_costing),
         progress=progress or schema_config.progress,
     )
@@ -990,6 +998,8 @@ def _load_dataset_examples(
 ):
     if dataset == "hotpotqa":
         return load_hotpotqa_examples(path, split=split, limit=limit)
+    if dataset == "musique":
+        return load_musique_examples(path, split=split, limit=limit)
     if dataset == "hover":
         return load_hover_examples(path, split=split, limit=limit)
     raise ValueError(f"unsupported dataset: {dataset}")
@@ -998,8 +1008,20 @@ def _load_dataset_examples(
 def _scorer(dataset: str):
     if dataset == "hotpotqa":
         return hotpotqa_exact_match
+    if dataset == "musique":
+        return musique_exact_match
     if dataset == "hover":
         return hover_label_accuracy
+    raise ValueError(f"unsupported dataset: {dataset}")
+
+
+def _task_label(dataset: str) -> str:
+    if dataset == "hotpotqa":
+        return "HotpotQA"
+    if dataset == "hover":
+        return "HoVer"
+    if dataset == "musique":
+        return "MuSiQue"
     raise ValueError(f"unsupported dataset: {dataset}")
 
 

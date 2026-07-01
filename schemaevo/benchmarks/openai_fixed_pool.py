@@ -7,13 +7,14 @@ from typing import Any, Literal
 from schemaevo.adapters.openai import OpenAIModuleConfig, openai_modules_to_lm_program
 from schemaevo.datasets.hotpotqa import load_hotpotqa_examples
 from schemaevo.datasets.hover import load_hover_examples
-from schemaevo.datasets.scorers import hotpotqa_exact_match, hover_label_accuracy
+from schemaevo.datasets.musique import load_musique_examples
+from schemaevo.datasets.scorers import hotpotqa_exact_match, hover_label_accuracy, musique_exact_match
 from schemaevo.eval.scoring import Scorer
 from schemaevo.optimizers.fixed_pool_schema import FixedPoolConfig, FixedPoolResult, run_fixed_pool_schema_mvp
 from schemaevo.programs.base import LMProgram, ProgramExample
 from schemaevo.schemas.proposer import HeuristicTraceSchemaProposer, OpenAISchemaProposer, SchemaProposer, TraceExample
 
-DatasetName = Literal["hotpotqa", "hover"]
+DatasetName = Literal["hotpotqa", "hover", "musique"]
 
 
 @dataclass(frozen=True)
@@ -105,7 +106,8 @@ def build_openai_benchmark_program(
     *,
     client: Any | None = None,
 ) -> LMProgram:
-    if config.dataset == "hotpotqa":
+    if config.dataset in {"hotpotqa", "musique"}:
+        task_name = "HotpotQA" if config.dataset == "hotpotqa" else "MuSiQue"
         modules = (
             OpenAIModuleConfig(
                 name="planner",
@@ -113,7 +115,7 @@ def build_openai_benchmark_program(
                 output_fields=("plan_summary",),
                 output_field_types={"plan_summary": "string"},
                 prompt=(
-                    "Read the context and write a concise plan_summary capturing the specific facts "
+                    f"Read the {task_name} context and write a concise plan_summary capturing the specific facts "
                     "needed to answer the question: the key entities, dates, numbers, and relationships, "
                     "including the bridge fact that links the hops. The downstream answerer will NOT see "
                     "the source documents, so include every fact required to answer. Return JSON only."
@@ -132,7 +134,7 @@ def build_openai_benchmark_program(
                 output_fields=("answer", "confidence"),
                 output_field_types={"answer": "string", "confidence": "number"},
                 prompt=(
-                    "Answer the HotpotQA question using ONLY the planner's plan and any SchemaEvo fields. "
+                    f"Answer the {task_name} question using ONLY the planner's plan and any SchemaEvo fields. "
                     "You do not have the source documents; rely on the distilled plan/evidence provided. "
                     "Give the shortest exact answer span only - a name, entity, number, or 'yes'/'no'. "
                     "Do not write a sentence or any explanation. "
@@ -144,7 +146,7 @@ def build_openai_benchmark_program(
             ),
         )
         return openai_modules_to_lm_program(
-            task="HotpotQA",
+            task=task_name,
             modules=modules,
             final_output_module="answerer",
             retriever_top_k=config.retriever_top_k,
@@ -197,7 +199,7 @@ def make_train_traces_from_examples(
 ) -> tuple[TraceExample, ...]:
     traces: list[TraceExample] = []
     for example in examples:
-        if dataset == "hotpotqa":
+        if dataset in {"hotpotqa", "musique"}:
             input_summary = f"question={example.inputs.get('question', '')}"
             output_summary = (
                 "The schema should preserve multi-hop bridge entities, next retrieval intent, "
@@ -247,6 +249,8 @@ def _load_examples(
 ) -> tuple[ProgramExample, ...]:
     if dataset == "hotpotqa":
         return load_hotpotqa_examples(path, split=split, limit=limit)
+    if dataset == "musique":
+        return load_musique_examples(path, split=split, limit=limit)
     if dataset == "hover":
         return load_hover_examples(path, split=split, limit=limit)
     raise ValueError(f"unsupported dataset: {dataset}")
@@ -255,6 +259,8 @@ def _load_examples(
 def _scorer_for_dataset(dataset: DatasetName) -> Scorer:
     if dataset == "hotpotqa":
         return hotpotqa_exact_match
+    if dataset == "musique":
+        return musique_exact_match
     if dataset == "hover":
         return hover_label_accuracy
     raise ValueError(f"unsupported dataset: {dataset}")

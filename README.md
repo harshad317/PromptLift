@@ -183,9 +183,9 @@ Commands:
 | `run-toy-mvp` | Local deterministic fixed-pool demo. |
 | `run-toy-closed-loop` | Local deterministic closed-loop demo. |
 | `check-benchmark-readiness` | Check API packages, `OPENAI_API_KEY`, dataset readability, split quality, and context coverage. |
-| `run-openai-fixed-pool` | Run fixed-pool SchemaEvo on local HotpotQA or HoVer files with OpenAI module runners. |
+| `run-openai-fixed-pool` | Run fixed-pool SchemaEvo on local HotpotQA, HoVer, or MuSiQue files with OpenAI module runners. |
 | `run-openai-causal-pilot` | Run a fixed-pool pilot and write causal field-ablation plus deployment-invariance reports. |
-| `run-openai-closed-loop` | Run closed-loop SchemaEvo on local HotpotQA or HoVer files with OpenAI module runners. |
+| `run-openai-closed-loop` | Run closed-loop SchemaEvo on local HotpotQA, HoVer, or MuSiQue files with OpenAI module runners. |
 | `run-openai-composability` | Run an external prompt optimizer first, then SchemaEvo as an additive schema layer. |
 | `run-openai-cross-model-transfer` | Optimize on one model, transfer the chosen schema, and evaluate it on another model. |
 | `write-budget-pareto-report` | Aggregate completed run summaries into JSON, CSV, and Markdown budget/Pareto reports. |
@@ -221,8 +221,13 @@ Run readiness checks:
 python3 -m schemaevo.cli check-benchmark-readiness \
   --hotpotqa /path/to/hotpotqa.json \
   --hover /path/to/hover.jsonl \
+  --musique /path/to/musique.json \
   --strict
 ```
+
+Strict fixed-pool readiness also checks that split paths do not visibly conflict
+with `--dataset`; for example, `--dataset hotpotqa --train data/musique/train.json`
+fails before any API calls. Use `--dataset musique` for MuSiQue pilots.
 
 If you need a cheap HotpotQA pilot split, use one of the helper scripts:
 
@@ -260,6 +265,25 @@ python3 -m schemaevo.cli run-openai-causal-pilot \
   --out artifacts/causal_pilot_hotpotqa
 ```
 
+Run the same causal pilot shape on MuSiQue:
+
+```bash
+python3 -m schemaevo.cli run-openai-causal-pilot \
+  --config configs/pilot_musique_gpt41mini.yaml \
+  --dataset musique \
+  --train data/musique/train.json \
+  --selection data/musique/selection.json \
+  --confirmation data/musique/confirmation.json \
+  --model gpt-4.1-mini \
+  --use-tiktoken-costing \
+  --input-price-per-million <input_price> \
+  --output-price-per-million <output_price> \
+  --cached-input-price-per-million <cached_input_price> \
+  --price-source-date <price_source_date> \
+  --max-dollar-cost <cap> \
+  --out artifacts/causal_pilot_musique
+```
+
 Run a full fixed-pool benchmark path:
 
 ```bash
@@ -283,7 +307,9 @@ python3 -m schemaevo.cli run-openai-fixed-pool \
 ```
 
 For HoVer, switch `--dataset hover`, use `configs/mvp_hover_gpt41mini.yaml`,
-and provide HoVer-shaped local files.
+and provide HoVer-shaped local files. For MuSiQue, switch `--dataset musique`,
+use `configs/mvp_musique_gpt41mini.yaml`, and provide MuSiQue files with either
+Hotpot-style `context` or native `paragraphs`.
 
 Run closed-loop SchemaEvo on local benchmark files:
 
@@ -472,6 +498,8 @@ Included configs:
   template with a dollar cap.
 - `configs/mvp_hotpotqa_gpt41mini.yaml`: OpenAI HotpotQA fixed-pool template.
 - `configs/mvp_hover_gpt41mini.yaml`: OpenAI HoVer fixed-pool template.
+- `configs/pilot_musique_gpt41mini.yaml`: cheap MuSiQue causal pilot template.
+- `configs/mvp_musique_gpt41mini.yaml`: OpenAI MuSiQue fixed-pool template.
 
 Token accounting defaults to a deterministic local proxy. For production
 accounting, install the API extra and pass `--use-tiktoken-costing`. For schema

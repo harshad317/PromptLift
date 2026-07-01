@@ -234,21 +234,32 @@ def make_human_minimal_schemas(
             seed=seed,
         )
         return [minimal, full]
-    if normalized in {"hotpotqa", "hotpot", "toy_multihop"}:
+    if normalized in {"hotpotqa", "hotpot", "toy_multihop", "musique"}:
         full = make_hotpotqa_schema_candidate(module_names=module_names, seed=seed)
         producer, consumer = _module_pair(module_names)
         minimal_names = {"question_type", "bridge_entity", "next_query_intent"}
         minimal_fields = tuple(
             field for field in full.module_fields[producer] if field.name in minimal_names
         )
+        task_name = "MuSiQue" if normalized == "musique" else "HotpotQA"
+        schema_prefix = "musique" if normalized == "musique" else "hotpotqa"
         minimal = _candidate(
-            schema_id="hotpotqa_human_minimal",
-            task="HotpotQA",
+            schema_id=f"{schema_prefix}_human_minimal",
+            task=task_name,
             producer=producer,
             consumer=consumer,
             fields=minimal_fields,
             seed=seed,
         )
+        if normalized == "musique":
+            full = _candidate(
+                schema_id="musique_human",
+                task="MuSiQue",
+                producer=producer,
+                consumer=consumer,
+                fields=full.module_fields[producer],
+                seed=seed,
+            )
         return [minimal, full]
     raise ValueError(f"unsupported task for human templates: {task}")
 

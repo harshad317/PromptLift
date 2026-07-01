@@ -17,13 +17,15 @@ from schemaevo.benchmarks.openai_closed_loop import (
 from schemaevo.benchmarks.readiness import check_benchmark_readiness, check_fixed_pool_split_readiness
 from schemaevo.benchmarks.openai_fixed_pool import (
     OpenAIFixedPoolBenchmarkConfig,
+    build_openai_benchmark_program,
     _scorer_for_dataset,
     run_openai_fixed_pool_benchmark,
 )
 from schemaevo.cli import _apply_budget_overrides, main as cli_main
 from schemaevo.datasets.hotpotqa import load_hotpotqa_examples
 from schemaevo.datasets.hover import load_hover_examples
-from schemaevo.datasets.scorers import hotpotqa_exact_match, hover_label_accuracy
+from schemaevo.datasets.musique import load_musique_examples
+from schemaevo.datasets.scorers import hotpotqa_exact_match, hover_label_accuracy, musique_exact_match
 from schemaevo.eval.budgeting import estimate_evaluation_budget
 from schemaevo.eval.cost_ledger import CostMeter, ModelPrice
 from schemaevo.examples.toy_multihop import (
@@ -1705,7 +1707,7 @@ def test_openai_adapter_emits_known_nested_object_schemas():
     assert conflict["properties"]["has_conflict"]["type"] == "boolean"
 
 
-def test_hotpotqa_and_hover_loaders_read_local_json_files(tmp_path):
+def test_hotpotqa_hover_and_musique_loaders_read_local_json_files(tmp_path):
     hotpot_path = tmp_path / "hotpot.json"
     hotpot_path.write_text(
         json.dumps(
@@ -1726,9 +1728,33 @@ def test_hotpotqa_and_hover_loaders_read_local_json_files(tmp_path):
         json.dumps({"uid": "v1", "claim": "Claim.", "label": "SUPPORTED"}) + "\n",
         encoding="utf-8",
     )
+    musique_path = tmp_path / "musique.json"
+    musique_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "m1",
+                    "question": "Who wrote the book?",
+                    "answer": "Ada Lovelace",
+                    "answer_aliases": ["Countess of Lovelace"],
+                    "paragraphs": [
+                        {
+                            "idx": 0,
+                            "title": "Book",
+                            "paragraph_text": "The book was written by Ada Lovelace.",
+                            "is_supporting": True,
+                        }
+                    ],
+                    "question_decomposition": [{"question": "Who wrote it?", "answer": "Ada Lovelace"}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     hotpot = load_hotpotqa_examples(hotpot_path, split="train")
     hover = load_hover_examples(hover_path, split="dev")
+    musique = load_musique_examples(musique_path, split="validation_selection")
 
     assert hotpot[0].inputs["question"] == "Q?"
     assert hotpot[0].expected["answer"] == "A"
@@ -1736,6 +1762,11 @@ def test_hotpotqa_and_hover_loaders_read_local_json_files(tmp_path):
     assert hover[0].inputs["claim"] == "Claim."
     assert hover[0].expected["label"] == "SUPPORTED"
     assert hover[0].metadata["dataset"] == "hover"
+    assert musique[0].inputs["question"] == "Who wrote the book?"
+    assert musique[0].inputs["context"][0]["text"] == "The book was written by Ada Lovelace."
+    assert musique[0].inputs["context"][0]["is_supporting"] is True
+    assert musique[0].expected["answer_aliases"] == ["Countess of Lovelace"]
+    assert musique[0].metadata["dataset"] == "musique"
 
 
 def test_hotpotqa_loader_reads_combined_split_dict(tmp_path):
@@ -1865,7 +1896,7 @@ def test_hover_loader_reads_combined_split_dict_and_answer_labels(tmp_path):
     assert final_test[0].inputs["context"] == ["Evidence supports it."]
 
 
-def test_benchmark_scorers_normalize_hotpotqa_and_hover_outputs(tmp_path):
+def test_benchmark_scorers_normalize_hotpotqa_hover_and_musique_outputs(tmp_path):
     hotpot_path = tmp_path / "hotpot.json"
     hotpot_path.write_text(
         json.dumps([{"_id": "h1", "question": "Q?", "answer": "The Compiler", "context": []}]),
@@ -1876,8 +1907,24 @@ def test_benchmark_scorers_normalize_hotpotqa_and_hover_outputs(tmp_path):
         json.dumps([{"uid": "v1", "claim": "Claim.", "label": "SUPPORTED"}]),
         encoding="utf-8",
     )
+    musique_path = tmp_path / "musique.json"
+    musique_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "m1",
+                    "question": "Q?",
+                    "answer": "Ada Lovelace",
+                    "answer_aliases": ["Countess of Lovelace"],
+                    "paragraphs": [{"paragraph_text": "Ada Lovelace is supported."}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
     hotpot_example = load_hotpotqa_examples(hotpot_path, split="dev")[0]
     hover_example = load_hover_examples(hover_path, split="dev")[0]
+    musique_example = load_musique_examples(musique_path, split="dev")[0]
 
     class Prediction:
         def __init__(self, final_output):
@@ -1885,6 +1932,7 @@ def test_benchmark_scorers_normalize_hotpotqa_and_hover_outputs(tmp_path):
 
     assert hotpotqa_exact_match(hotpot_example, Prediction({"answer": "compiler"})) == 1.0
     assert hover_label_accuracy(hover_example, Prediction({"label": "supported"})) == 1.0
+    assert musique_exact_match(musique_example, Prediction({"answer": "the countess of lovelace"})) == 1.0
 
 
 def test_openai_hotpotqa_benchmark_uses_preregistered_exact_match(tmp_path):
@@ -1903,6 +1951,57 @@ def test_openai_hotpotqa_benchmark_uses_preregistered_exact_match(tmp_path):
 
     assert scorer(example, Prediction({"answer": "the compiler"})) == 1.0
     assert scorer(example, Prediction({"answer": "the compiler was correct"})) == 0.0
+
+
+def test_openai_musique_benchmark_uses_musique_identity_and_alias_scorer(tmp_path):
+    musique_path = tmp_path / "musique.json"
+    musique_path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "m1",
+                    "question": "Q?",
+                    "answer": "Ada Lovelace",
+                    "answer_aliases": ["Countess of Lovelace"],
+                    "paragraphs": [{"paragraph_text": "Ada Lovelace is supported."}],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    example = load_musique_examples(musique_path, split="dev")[0]
+    program = build_openai_benchmark_program(
+        OpenAIFixedPoolBenchmarkConfig(
+            dataset="musique",
+            train_path=musique_path,
+            selection_path=musique_path,
+            confirmation_path=musique_path,
+            model="gpt-4.1-mini",
+        )
+    )
+
+    class Prediction:
+        def __init__(self, final_output):
+            self.final_output = final_output
+
+    scorer = _scorer_for_dataset("musique")
+
+    assert program.task == "MuSiQue"
+    assert "MuSiQue question" in program.modules[-1].prompt
+    assert scorer(example, Prediction({"answer": "countess of lovelace"})) == 1.0
+
+
+def test_musique_human_templates_use_musique_identity():
+    schemas = make_human_minimal_schemas(
+        task="musique",
+        module_names=("planner", "answerer"),
+        seed=0,
+    )
+
+    assert schemas[0].task == "MuSiQue"
+    assert schemas[1].task == "MuSiQue"
+    assert schemas[0].schema_id.startswith("musique_human_minimal_")
+    assert schemas[1].schema_id.startswith("musique_human_")
 
 
 def test_benchmark_readiness_reports_local_data_and_missing_key(tmp_path, monkeypatch):
@@ -2153,6 +2252,42 @@ def test_fixed_pool_split_readiness_rejects_cross_split_overlap(tmp_path, monkey
     assert readiness.datasets["hotpotqa.selection"]["ok"]
     assert not readiness.ready
     assert any("overlap between train and selection" in reason for reason in readiness.reasons)
+
+
+def test_fixed_pool_split_readiness_rejects_dataset_path_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        "schemaevo.benchmarks.readiness.importlib.util.find_spec",
+        lambda _name: object(),
+    )
+    musique_dir = tmp_path / "data" / "musique"
+    musique_dir.mkdir(parents=True)
+
+    for name in ("train", "selection", "confirmation"):
+        (musique_dir / f"{name}.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "_id": name,
+                        "question": "What is the answer?",
+                        "answer": "alpha",
+                        "context": [["Title", ["alpha is supported."]]],
+                    }
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    readiness = check_fixed_pool_split_readiness(
+        dataset="hotpotqa",
+        train_path=musique_dir / "train.json",
+        selection_path=musique_dir / "selection.json",
+        confirmation_path=musique_dir / "confirmation.json",
+        require_context=True,
+    )
+
+    assert not readiness.ready
+    assert any("use --dataset musique" in reason for reason in readiness.reasons)
 
 
 def test_cli_run_openai_fixed_pool_checks_all_split_readiness(tmp_path, monkeypatch, capsys):

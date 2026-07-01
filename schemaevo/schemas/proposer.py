@@ -512,6 +512,12 @@ def _base_template(task: str, module_names: tuple[str, ...], seed: int) -> Schem
         return make_hover_schema_candidate(module_names=module_names, seed=seed)
     if normalized in {"hotpotqa", "hotpot", "toy_multihop"}:
         return make_hotpotqa_schema_candidate(module_names=module_names, seed=seed)
+    if normalized == "musique":
+        return make_hotpotqa_schema_candidate(
+            module_names=module_names,
+            seed=seed,
+            schema_id="musique_human",
+        ).replace(task="MuSiQue")
     raise ValueError(f"unsupported task for trace proposer: {task}")
 
 

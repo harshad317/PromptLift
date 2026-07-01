@@ -12,6 +12,15 @@ def hotpotqa_exact_match(example: ProgramExample, prediction: ProgramPrediction)
     return 1.0 if expected and predicted == expected else 0.0
 
 
+def musique_exact_match(example: ProgramExample, prediction: ProgramPrediction) -> float:
+    expected_answers = [str(example.expected.get("answer", ""))]
+    aliases = example.expected.get("answer_aliases", ())
+    if isinstance(aliases, (list, tuple)):
+        expected_answers.extend(str(alias) for alias in aliases)
+    predicted = _normalize_answer(str(prediction.final_output.get("answer", "")))
+    return 1.0 if predicted and predicted in {_normalize_answer(answer) for answer in expected_answers if answer} else 0.0
+
+
 def hotpotqa_f1(example: ProgramExample, prediction: ProgramPrediction) -> float:
     """Token-overlap F1, the standard HotpotQA metric alongside exact match.
 
