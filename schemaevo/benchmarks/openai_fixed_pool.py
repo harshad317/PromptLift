@@ -113,10 +113,10 @@ def build_openai_benchmark_program(
                 output_fields=("plan_summary",),
                 output_field_types={"plan_summary": "string"},
                 prompt=(
-                    "Write plan_summary as a SHORT high-level reasoning plan only: name the hops/steps "
-                    "needed, in one or two sentences. Do NOT put the specific answer facts in "
-                    "plan_summary - no names, dates, numbers, or the final answer. Any concrete evidence "
-                    "must go into the typed SchemaEvo fields, not into plan_summary. Return JSON only."
+                    "Read the context and write a concise plan_summary capturing the specific facts "
+                    "needed to answer the question: the key entities, dates, numbers, and relationships, "
+                    "including the bridge fact that links the hops. The downstream answerer will NOT see "
+                    "the source documents, so include every fact required to answer. Return JSON only."
                 ),
                 model=config.model,
                 max_output_tokens=512,
