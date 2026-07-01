@@ -21,8 +21,12 @@ class CausalPilotReport:
     max_blank_drop: float
     max_downstream_disabled_drop: float
     causal_drop_fraction: float
+    ablation_signal_interpretable: bool
+    ablation_supports_primary_gain: bool
     control_in_top_k_warning: bool
     best_control_vs_primary_delta: float | None
+    empirical_status: str
+    null_signal_warning: bool
     proceed: bool
     reasons: tuple[str, ...]
     artifacts: dict[str, str]
@@ -46,16 +50,27 @@ def build_causal_pilot_report(
     max_blank = _max_drop(result, "blank")
     max_downstream_disabled = _max_drop(result, "downstream_disabled")
     causal_drop = max(max_mask, max_shuffle)
-    causal_fraction = causal_drop / score_delta if score_delta > 0 else 0.0
+    ablation_signal_interpretable = score_delta > 0
+    causal_fraction = causal_drop / score_delta if ablation_signal_interpretable else 0.0
+    ablation_supports_primary_gain = ablation_signal_interpretable and (
+        causal_drop >= min_absolute_drop or causal_fraction >= min_fraction_of_delta
+    )
+    control_delta = result.control_guardrail.best_control_vs_primary_delta
+    control_matched_or_beat_primary = control_delta is not None and control_delta >= 0.0
+    empirical_status = _empirical_status(
+        score_delta=score_delta,
+        control_matched_or_beat_primary=control_matched_or_beat_primary,
+        ablation_supports_primary_gain=ablation_supports_primary_gain,
+    )
     reasons: list[str] = []
     if score_delta <= 0:
         reasons.append("primary schema did not improve over the fixed-schema baseline")
-    if causal_drop < min_absolute_drop and causal_fraction < min_fraction_of_delta:
+        reasons.append("field ablations are not interpretable as causal support without a positive primary gain")
+    elif not ablation_supports_primary_gain:
         reasons.append("mask/shuffle ablations did not remove enough of the observed gain")
     if not result.field_ablation_results:
         reasons.append("field ablation results are missing")
-    control_delta = result.control_guardrail.best_control_vs_primary_delta
-    if control_delta is not None and control_delta >= 0.0:
+    if control_matched_or_beat_primary:
         reasons.append("a random or validator-only control schema matched or beat the primary schema")
     proceed = not reasons
     artifacts: dict[str, str] = {}
@@ -71,8 +86,12 @@ def build_causal_pilot_report(
         max_blank_drop=max_blank,
         max_downstream_disabled_drop=max_downstream_disabled,
         causal_drop_fraction=causal_fraction,
+        ablation_signal_interpretable=ablation_signal_interpretable,
+        ablation_supports_primary_gain=ablation_supports_primary_gain,
         control_in_top_k_warning=result.control_guardrail.control_in_top_k_warning,
         best_control_vs_primary_delta=control_delta,
+        empirical_status=empirical_status,
+        null_signal_warning=empirical_status != "positive_schema_signal",
         proceed=proceed,
         reasons=tuple(reasons),
         artifacts=artifacts,
@@ -96,8 +115,12 @@ def build_causal_pilot_report(
             max_blank_drop=report.max_blank_drop,
             max_downstream_disabled_drop=report.max_downstream_disabled_drop,
             causal_drop_fraction=report.causal_drop_fraction,
+            ablation_signal_interpretable=report.ablation_signal_interpretable,
+            ablation_supports_primary_gain=report.ablation_supports_primary_gain,
             control_in_top_k_warning=report.control_in_top_k_warning,
             best_control_vs_primary_delta=report.best_control_vs_primary_delta,
+            empirical_status=report.empirical_status,
+            null_signal_warning=report.null_signal_warning,
             proceed=report.proceed,
             reasons=report.reasons,
             artifacts=artifacts,
@@ -115,6 +138,21 @@ def _max_drop(result: FixedPoolResult, ablation: str) -> float:
         ),
         default=0.0,
     )
+
+
+def _empirical_status(
+    *,
+    score_delta: float,
+    control_matched_or_beat_primary: bool,
+    ablation_supports_primary_gain: bool,
+) -> str:
+    if score_delta <= 0:
+        return "negative_or_no_primary_gain"
+    if control_matched_or_beat_primary:
+        return "control_matches_or_beats_primary"
+    if not ablation_supports_primary_gain:
+        return "no_causal_ablation_support"
+    return "positive_schema_signal"
 
 
 def _markdown(report: CausalPilotReport) -> str:
@@ -136,8 +174,12 @@ def _markdown(report: CausalPilotReport) -> str:
         f"| Max blank drop | {report.max_blank_drop:.6f} |\n"
         f"| Max downstream-disabled drop | {report.max_downstream_disabled_drop:.6f} |\n"
         f"| Causal drop fraction | {report.causal_drop_fraction:.6f} |\n"
+        f"| Ablation signal interpretable | {str(report.ablation_signal_interpretable)} |\n"
+        f"| Ablation supports primary gain | {str(report.ablation_supports_primary_gain)} |\n"
         f"| Control in top-k warning | {str(report.control_in_top_k_warning)} |\n"
-        f"| Best control vs primary delta | {_format_optional(report.best_control_vs_primary_delta)} |\n\n"
+        f"| Best control vs primary delta | {_format_optional(report.best_control_vs_primary_delta)} |\n"
+        f"| Empirical status | {report.empirical_status} |\n"
+        f"| Null-signal warning | {str(report.null_signal_warning)} |\n\n"
         "Reasons:\n"
         f"{reasons}\n\n"
         f"Statement: scrambling field content drops score by {report.max_shuffle_drop:.6f}.\n"

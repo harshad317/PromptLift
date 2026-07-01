@@ -33,7 +33,9 @@ from schemaevo.examples.toy_multihop import (
     toy_scorer,
 )
 from schemaevo.eval.cache import RolloutCache
+from schemaevo.eval.field_ablations import FieldAblationResult
 from schemaevo.eval.scoring import CandidateEvalResult, evaluate_program
+from schemaevo.eval.stats import BootstrapDiff, PairedComparison
 from schemaevo.experiments.budget_pareto import build_budget_pareto_report
 from schemaevo.experiments.causal_pilot import build_causal_pilot_report
 from schemaevo.experiments.deployment_invariance import build_fixed_pool_deployment_report
@@ -41,7 +43,10 @@ from schemaevo.experiments.external_prompt_optimizer import ExternalPromptOptimi
 from schemaevo.experiments.composability import run_prompt_optimizer_then_schemaevo
 from schemaevo.experiments.transfer import run_openai_cross_model_schema_transfer
 from schemaevo.optimizers.fixed_pool_schema import (
+    ControlGuardrail,
     FixedPoolConfig,
+    FixedPoolResult,
+    MVPDecision,
     _make_control_guardrail,
     run_fixed_pool_schema_mvp,
 )
@@ -1338,6 +1343,103 @@ def _candidate_eval_result(*, schema_id: str, mean_score: float) -> CandidateEva
     )
 
 
+def _fixed_pool_result_for_causal_pilot_null_signal() -> FixedPoolResult:
+    primary_schema = make_hotpotqa_schema_candidate(module_names=("planner", "answerer"), seed=0)
+    control_field = SchemaField(
+        name="opaque_key",
+        type="string",
+        description="Opaque control field.",
+        required=False,
+        producer_module="planner",
+        consumer_modules=("answerer",),
+    )
+    control_schema = SchemaCandidate(
+        schema_id="random_control",
+        parent_schema_id=None,
+        task="HotpotQA",
+        module_fields={"planner": (control_field,)},
+        consumption_rules=(
+            ConsumptionRule(
+                consumer_module="answerer",
+                field_name="opaque_key",
+                instruction="Use only if relevant.",
+                required_behavior="Do not infer evidence.",
+                fallback_if_missing="Use original behavior.",
+            ),
+        ),
+        validators={},
+        schema_token_budget=128,
+        mutation_history=("random_schema_control",),
+        proposer_seed=0,
+        control_type="random",
+    )
+    baseline = _candidate_eval_result(schema_id="original_schema", mean_score=0.5)
+    primary = _candidate_eval_result(schema_id=primary_schema.schema_id, mean_score=0.4)
+    control = _candidate_eval_result(schema_id=control_schema.schema_id, mean_score=0.475)
+    return FixedPoolResult(
+        baseline_selection_result=baseline,
+        baseline_confirmation_result=baseline,
+        schema_pool=(primary_schema, control_schema),
+        smoke_results=(),
+        selection_results=(primary, control),
+        top_selection_results=(primary, control),
+        confirmation_results=(primary, control),
+        primary_confirmation_result=primary,
+        best_confirmation_result=control,
+        paired_stats=PairedComparison(
+            bootstrap=BootstrapDiff(
+                mean_diff=-0.1,
+                ci_low=-0.2,
+                ci_high=0.0,
+                n_resamples=10,
+            ),
+            approximate_randomization_p=1.0,
+        ),
+        corrected_confirmation_stats={},
+        heldout_test_result=None,
+        heldout_test_stats=None,
+        field_ablation_results=(
+            FieldAblationResult(
+                ablation="mask",
+                field_name="next_query_intent",
+                mean_score=0.35,
+                drop_vs_unablated=0.05,
+                invalid_output_rate=0.0,
+                per_example_scores=(0.35,),
+            ),
+            FieldAblationResult(
+                ablation="shuffle",
+                field_name="next_query_intent",
+                mean_score=0.4,
+                drop_vs_unablated=0.0,
+                invalid_output_rate=0.0,
+                per_example_scores=(0.4,),
+            ),
+        ),
+        decision=MVPDecision(
+            proceed=False,
+            score_delta=-0.1,
+            invalid_output_rate=0.0,
+            field_masking_max_drop=0.05,
+            reasons=("score delta below bar",),
+        ),
+        control_guardrail=ControlGuardrail(
+            control_in_top_k_warning=True,
+            selection_top_k_control_schema_ids=(control_schema.schema_id,),
+            confirmation_top_k_control_schema_ids=(control_schema.schema_id,),
+            best_control_schema_id=control_schema.schema_id,
+            best_control_confirmation_mean=0.475,
+            best_control_vs_primary_delta=0.075,
+            warning="control matched primary",
+        ),
+        cost_summary={},
+        budget_summary={},
+        proposal_usage={},
+        reflection_rounds=(),
+        artifacts={},
+    )
+
+
 def test_rollout_cache_reuses_identical_program_example_seed(tmp_path):
     program = build_toy_program()
     calls = {"planner": 0}
@@ -2321,9 +2423,32 @@ def test_causal_pilot_and_deployment_reports_write_artifacts(tmp_path):
 
     assert causal.proceed
     assert causal.max_shuffle_drop > 0.0
+    assert causal.empirical_status == "positive_schema_signal"
+    assert causal.ablation_signal_interpretable
+    assert causal.ablation_supports_primary_gain
+    assert not causal.null_signal_warning
     assert deployment.serving_invariant
     assert Path(causal.artifacts["summary"]).exists()
     assert Path(deployment.artifacts["summary"]).exists()
+
+
+def test_causal_pilot_reports_negative_null_signal_when_primary_loses_to_control():
+    result = _fixed_pool_result_for_causal_pilot_null_signal()
+
+    causal = build_causal_pilot_report(
+        result=result,
+        dataset="musique",
+        model="gpt-4.1-mini",
+    )
+
+    assert not causal.proceed
+    assert causal.empirical_status == "negative_or_no_primary_gain"
+    assert causal.null_signal_warning
+    assert not causal.ablation_signal_interpretable
+    assert not causal.ablation_supports_primary_gain
+    assert causal.best_control_vs_primary_delta == pytest.approx(0.075)
+    assert "field ablations are not interpretable" in " ".join(causal.reasons)
+    assert "control schema matched or beat" in " ".join(causal.reasons)
 
 
 def test_budget_pareto_report_aggregates_summary_files(tmp_path):
