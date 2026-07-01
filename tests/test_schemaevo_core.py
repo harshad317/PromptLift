@@ -62,6 +62,7 @@ from schemaevo.schemas.human_templates import (
     make_hotpotqa_schema_candidate,
     make_hover_schema_candidate,
     make_human_minimal_schemas,
+    make_validator_only_schema,
 )
 from schemaevo.schemas.mutations import Mutation, apply_mutation
 from schemaevo.schemas.proposer import (
@@ -739,6 +740,31 @@ def test_fixed_pool_control_guardrail_flags_controls_in_top_k():
     assert guardrail.confirmation_top_k_control_schema_ids == (control.schema_id,)
     assert guardrail.best_control_schema_id == control.schema_id
     assert guardrail.best_control_vs_primary_delta == pytest.approx(0.1)
+    assert not guardrail.primary_is_control
+    assert guardrail.primary_control_type is None
+
+
+def test_fixed_pool_control_guardrail_flags_control_primary():
+    control = make_validator_only_schema(
+        task="HotpotQA",
+        module_names=("planner", "answerer"),
+        seed=0,
+    )
+    primary = _candidate_eval_result(schema_id=control.schema_id, mean_score=0.6)
+
+    guardrail = _make_control_guardrail(
+        schema_pool=(control,),
+        top_selection_results=(primary,),
+        confirmation_results=(primary,),
+        primary_confirmation=primary,
+    )
+
+    assert guardrail.control_in_top_k_warning
+    assert guardrail.primary_is_control
+    assert guardrail.primary_control_type == "validator_only"
+    assert guardrail.best_control_schema_id == control.schema_id
+    assert guardrail.best_control_vs_primary_delta == pytest.approx(0.0)
+    assert "Primary selected schema is a control" in str(guardrail.warning)
 
 
 def test_fixed_pool_records_schema_proposal_usage(tmp_path):
@@ -1427,12 +1453,71 @@ def _fixed_pool_result_for_causal_pilot_null_signal() -> FixedPoolResult:
         ),
         control_guardrail=ControlGuardrail(
             control_in_top_k_warning=True,
+            primary_is_control=False,
+            primary_control_type=None,
             selection_top_k_control_schema_ids=(control_schema.schema_id,),
             confirmation_top_k_control_schema_ids=(control_schema.schema_id,),
             best_control_schema_id=control_schema.schema_id,
             best_control_confirmation_mean=0.475,
             best_control_vs_primary_delta=0.075,
             warning="control matched primary",
+        ),
+        cost_summary={},
+        budget_summary={},
+        proposal_usage={},
+        reflection_rounds=(),
+        artifacts={},
+    )
+
+
+def _fixed_pool_result_for_causal_pilot_control_primary() -> FixedPoolResult:
+    control_schema = make_validator_only_schema(
+        task="MuSiQue",
+        module_names=("planner", "answerer"),
+        seed=0,
+    )
+    baseline = _candidate_eval_result(schema_id="original_schema", mean_score=0.425)
+    primary = _candidate_eval_result(schema_id=control_schema.schema_id, mean_score=0.425)
+    return FixedPoolResult(
+        baseline_selection_result=baseline,
+        baseline_confirmation_result=baseline,
+        schema_pool=(control_schema,),
+        smoke_results=(),
+        selection_results=(primary,),
+        top_selection_results=(primary,),
+        confirmation_results=(primary,),
+        primary_confirmation_result=primary,
+        best_confirmation_result=primary,
+        paired_stats=PairedComparison(
+            bootstrap=BootstrapDiff(
+                mean_diff=0.0,
+                ci_low=-0.1,
+                ci_high=0.1,
+                n_resamples=10,
+            ),
+            approximate_randomization_p=1.0,
+        ),
+        corrected_confirmation_stats={},
+        heldout_test_result=None,
+        heldout_test_stats=None,
+        field_ablation_results=(),
+        decision=MVPDecision(
+            proceed=False,
+            score_delta=0.0,
+            invalid_output_rate=0.0,
+            field_masking_max_drop=0.0,
+            reasons=("score delta below bar", "no field ablations were produced"),
+        ),
+        control_guardrail=ControlGuardrail(
+            control_in_top_k_warning=True,
+            primary_is_control=True,
+            primary_control_type="validator_only",
+            selection_top_k_control_schema_ids=(control_schema.schema_id,),
+            confirmation_top_k_control_schema_ids=(control_schema.schema_id,),
+            best_control_schema_id=control_schema.schema_id,
+            best_control_confirmation_mean=0.425,
+            best_control_vs_primary_delta=0.0,
+            warning="Primary selected schema is a control; treat schema-effect claims as null.",
         ),
         cost_summary={},
         budget_summary={},
@@ -2584,6 +2669,29 @@ def test_causal_pilot_reports_negative_null_signal_when_primary_loses_to_control
     assert causal.best_control_vs_primary_delta == pytest.approx(0.075)
     assert "field ablations are not interpretable" in " ".join(causal.reasons)
     assert "control schema matched or beat" in " ".join(causal.reasons)
+
+
+def test_causal_pilot_reports_control_primary_as_distinct_null_signal():
+    result = _fixed_pool_result_for_causal_pilot_control_primary()
+
+    causal = build_causal_pilot_report(
+        result=result,
+        dataset="musique",
+        model="gpt-4.1-mini",
+    )
+
+    assert not causal.proceed
+    assert causal.empirical_status == "control_selected_as_primary"
+    assert causal.null_signal_warning
+    assert causal.primary_is_control
+    assert causal.primary_control_type == "validator_only"
+    assert not causal.ablation_signal_interpretable
+    assert not causal.ablation_supports_primary_gain
+    assert causal.best_control_vs_primary_delta == pytest.approx(0.0)
+    joined = " ".join(causal.reasons)
+    assert "primary selected schema is a validator_only control" in joined
+    assert "field ablations are not applicable" in joined
+    assert "field ablation results are missing" not in joined
 
 
 def test_budget_pareto_report_aggregates_summary_files(tmp_path):

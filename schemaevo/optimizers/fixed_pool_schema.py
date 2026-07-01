@@ -106,6 +106,8 @@ class MVPDecision:
 @dataclass(frozen=True)
 class ControlGuardrail:
     control_in_top_k_warning: bool
+    primary_is_control: bool
+    primary_control_type: str | None
     selection_top_k_control_schema_ids: tuple[str, ...]
     confirmation_top_k_control_schema_ids: tuple[str, ...]
     best_control_schema_id: str | None
@@ -1473,6 +1475,8 @@ def _make_control_guardrail(
     primary_confirmation: CandidateEvalResult,
 ) -> ControlGuardrail:
     schema_by_id = {schema.schema_id: schema for schema in schema_pool}
+    primary_schema = schema_by_id.get(primary_confirmation.schema_id)
+    primary_is_control = _is_control_schema(primary_schema)
     selection_control_ids = tuple(
         result.schema_id
         for result in top_selection_results
@@ -1492,13 +1496,18 @@ def _make_control_guardrail(
         else None
     )
     warning = bool(selection_control_ids or confirmation_control_results)
-    warning_text = (
-        "Control schema appeared in selection/confirmation top-k; treat positive schema claims as null-risk."
-        if warning
-        else None
-    )
+    if primary_is_control:
+        warning_text = "Primary selected schema is a control; treat schema-effect claims as null."
+    elif warning:
+        warning_text = (
+            "Control schema appeared in selection/confirmation top-k; treat positive schema claims as null-risk."
+        )
+    else:
+        warning_text = None
     return ControlGuardrail(
         control_in_top_k_warning=warning,
+        primary_is_control=primary_is_control,
+        primary_control_type=primary_schema.control_type if primary_is_control and primary_schema else None,
         selection_top_k_control_schema_ids=selection_control_ids,
         confirmation_top_k_control_schema_ids=tuple(
             result.schema_id for result in confirmation_control_results

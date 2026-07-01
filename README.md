@@ -478,6 +478,12 @@ Experiment reports:
 | `run-openai-cross-model-transfer` | `cross_model_transfer_report.json`, `cross_model_transfer_report.md`, and source/target evaluation artifacts. |
 | `write-budget-pareto-report` | JSON, CSV, and Markdown budget/Pareto report files. |
 
+Fixed-pool summaries include `control_guardrail`. If `primary_is_control` is
+true, the selected primary is a random or validator-only control rather than a
+designed schema; causal pilot reports surface this as
+`empirical_status: control_selected_as_primary` and should be treated as a null
+schema signal.
+
 ## Configuration
 
 Configs are YAML mappings. The main sections are:
