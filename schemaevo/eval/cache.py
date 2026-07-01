@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import inspect
 import json
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,7 @@ class RolloutCache:
         return hash_obj(
             {
                 "program": program_fingerprint(program),
-                "example_id": example.example_id,
+                "example": example_fingerprint(example),
                 "seed": seed,
                 "intervention_id": intervention_id,
             }
@@ -71,6 +72,7 @@ def program_fingerprint(program: LMProgram) -> dict[str, Any]:
         "retriever_top_k": program.retriever_top_k,
         "final_output_module": program.final_output_module,
         "schema": program.schema_candidate.to_dict() if program.schema_candidate else None,
+        "metadata": program.metadata,
         "modules": [
             {
                 "name": module.name,
@@ -83,9 +85,48 @@ def program_fingerprint(program: LMProgram) -> dict[str, Any]:
                 "max_output_tokens": module.max_output_tokens,
                 "llm_calls": module.llm_calls,
                 "retriever_calls": module.retriever_calls,
+                "metadata": module.metadata,
+                "runner": runner_fingerprint(module.runner),
             }
             for module in program.modules
         ],
+    }
+
+
+def example_fingerprint(example: ProgramExample) -> dict[str, Any]:
+    return {
+        "example_id": example.example_id,
+        "split": example.split,
+        "inputs": example.inputs,
+        "expected": example.expected,
+        "metadata": example.metadata,
+    }
+
+
+def runner_fingerprint(runner: Any) -> dict[str, Any] | None:
+    if runner is None:
+        return None
+    state: Any = None
+    getstate = getattr(runner, "__getstate__", None)
+    if callable(getstate):
+        try:
+            state = getstate()
+        except Exception:
+            state = None
+    source_hash = ""
+    try:
+        source_hash = hash_obj(inspect.getsource(runner))
+    except Exception:
+        try:
+            source_hash = hash_obj(inspect.getsource(runner.__class__))
+        except Exception:
+            source_hash = ""
+    return {
+        "module": getattr(runner, "__module__", runner.__class__.__module__),
+        "qualname": getattr(runner, "__qualname__", runner.__class__.__qualname__),
+        "class": f"{runner.__class__.__module__}.{runner.__class__.__qualname__}",
+        "source_hash": source_hash,
+        "state": state,
     }
 
 

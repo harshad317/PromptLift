@@ -218,7 +218,7 @@ class SchemaCandidate:
             raise ValueError("schema_id is required")
         if not self.task:
             raise ValueError("task is required")
-        seen: set[tuple[str, str]] = set()
+        seen: set[str] = set()
         for module_name, fields in self.module_fields.items():
             if not module_name:
                 raise ValueError("module field map contains empty module name")
@@ -228,14 +228,16 @@ class SchemaCandidate:
                         f"field {schema_field.name!r} producer {schema_field.producer_module!r} "
                         f"does not match module map {module_name!r}"
                     )
-                key = (module_name, schema_field.name)
-                if key in seen:
-                    raise ValueError(f"duplicate field in module {module_name!r}: {schema_field.name}")
-                seen.add(key)
+                if schema_field.name in seen:
+                    raise ValueError(f"duplicate schema field name: {schema_field.name}")
+                seen.add(schema_field.name)
         field_names = {field.name for field in self.all_fields}
         for rule in self.consumption_rules:
             if rule.field_name not in field_names:
                 raise ValueError(f"consumption rule references unknown field: {rule.field_name}")
+        unknown_validators = set(self.validators) - field_names
+        if unknown_validators:
+            raise ValueError(f"validators reference unknown fields: {sorted(unknown_validators)}")
         if self.schema_token_budget <= 0:
             raise ValueError("schema_token_budget must be positive")
 

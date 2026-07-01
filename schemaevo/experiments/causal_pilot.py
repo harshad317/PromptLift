@@ -21,6 +21,8 @@ class CausalPilotReport:
     max_blank_drop: float
     max_downstream_disabled_drop: float
     causal_drop_fraction: float
+    control_in_top_k_warning: bool
+    best_control_vs_primary_delta: float | None
     proceed: bool
     reasons: tuple[str, ...]
     artifacts: dict[str, str]
@@ -52,6 +54,9 @@ def build_causal_pilot_report(
         reasons.append("mask/shuffle ablations did not remove enough of the observed gain")
     if not result.field_ablation_results:
         reasons.append("field ablation results are missing")
+    control_delta = result.control_guardrail.best_control_vs_primary_delta
+    if control_delta is not None and control_delta >= 0.0:
+        reasons.append("a random or validator-only control schema matched or beat the primary schema")
     proceed = not reasons
     artifacts: dict[str, str] = {}
     report = CausalPilotReport(
@@ -66,6 +71,8 @@ def build_causal_pilot_report(
         max_blank_drop=max_blank,
         max_downstream_disabled_drop=max_downstream_disabled,
         causal_drop_fraction=causal_fraction,
+        control_in_top_k_warning=result.control_guardrail.control_in_top_k_warning,
+        best_control_vs_primary_delta=control_delta,
         proceed=proceed,
         reasons=tuple(reasons),
         artifacts=artifacts,
@@ -89,6 +96,8 @@ def build_causal_pilot_report(
             max_blank_drop=report.max_blank_drop,
             max_downstream_disabled_drop=report.max_downstream_disabled_drop,
             causal_drop_fraction=report.causal_drop_fraction,
+            control_in_top_k_warning=report.control_in_top_k_warning,
+            best_control_vs_primary_delta=report.best_control_vs_primary_delta,
             proceed=report.proceed,
             reasons=report.reasons,
             artifacts=artifacts,
@@ -126,8 +135,14 @@ def _markdown(report: CausalPilotReport) -> str:
         f"| Max shuffle drop | {report.max_shuffle_drop:.6f} |\n"
         f"| Max blank drop | {report.max_blank_drop:.6f} |\n"
         f"| Max downstream-disabled drop | {report.max_downstream_disabled_drop:.6f} |\n"
-        f"| Causal drop fraction | {report.causal_drop_fraction:.6f} |\n\n"
+        f"| Causal drop fraction | {report.causal_drop_fraction:.6f} |\n"
+        f"| Control in top-k warning | {str(report.control_in_top_k_warning)} |\n"
+        f"| Best control vs primary delta | {_format_optional(report.best_control_vs_primary_delta)} |\n\n"
         "Reasons:\n"
         f"{reasons}\n\n"
         f"Statement: scrambling field content drops score by {report.max_shuffle_drop:.6f}.\n"
     )
+
+
+def _format_optional(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.6f}"

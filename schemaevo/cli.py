@@ -19,7 +19,7 @@ from schemaevo.benchmarks.openai_fixed_pool import (
     run_openai_fixed_pool_benchmark,
 )
 from schemaevo.benchmarks.readiness import check_benchmark_readiness, check_fixed_pool_split_readiness
-from schemaevo.datasets.scorers import hotpotqa_exact_match, hotpotqa_f1, hover_label_accuracy
+from schemaevo.datasets.scorers import hotpotqa_exact_match, hover_label_accuracy
 from schemaevo.datasets.hotpotqa import load_hotpotqa_examples
 from schemaevo.datasets.hover import load_hover_examples
 from schemaevo.examples.toy_multihop import (
@@ -997,7 +997,7 @@ def _load_dataset_examples(
 
 def _scorer(dataset: str):
     if dataset == "hotpotqa":
-        return hotpotqa_f1
+        return hotpotqa_exact_match
     if dataset == "hover":
         return hover_label_accuracy
     raise ValueError(f"unsupported dataset: {dataset}")

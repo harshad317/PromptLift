@@ -36,9 +36,11 @@ class OpenAIClosedLoopBenchmarkResult:
     optimizer_result: SchemaEvoRunResult
     confirmation_baseline: CandidateEvalResult
     confirmation_results: tuple[CandidateEvalResult, ...]
+    primary_confirmation: CandidateEvalResult | None
     best_confirmation: CandidateEvalResult | None
     heldout_baseline: CandidateEvalResult | None
     heldout_results: tuple[CandidateEvalResult, ...]
+    primary_heldout: CandidateEvalResult | None
     best_heldout: CandidateEvalResult | None
     artifacts: dict[str, str]
 
@@ -46,8 +48,16 @@ class OpenAIClosedLoopBenchmarkResult:
         return {
             "optimizer": self.optimizer_result.summary(),
             "confirmation_baseline_mean": self.confirmation_baseline.mean_score,
+            "primary_confirmation_schema_id": (
+                self.primary_confirmation.schema_id if self.primary_confirmation else None
+            ),
+            "primary_confirmation_mean": (
+                self.primary_confirmation.mean_score if self.primary_confirmation else None
+            ),
             "best_confirmation_mean": self.best_confirmation.mean_score if self.best_confirmation else None,
             "heldout_baseline_mean": self.heldout_baseline.mean_score if self.heldout_baseline else None,
+            "primary_heldout_schema_id": self.primary_heldout.schema_id if self.primary_heldout else None,
+            "primary_heldout_mean": self.primary_heldout.mean_score if self.primary_heldout else None,
             "best_heldout_mean": self.best_heldout.mean_score if self.best_heldout else None,
             "confirmation_schema_ids": [result.schema_id for result in self.confirmation_results],
             "heldout_schema_ids": [result.schema_id for result in self.heldout_results],
@@ -137,9 +147,11 @@ def run_openai_closed_loop_benchmark(
         )
         for index, record in enumerate(optimizer_result.final_records)
     )
-    best_confirmation = _best(confirmation_results)
+    primary_confirmation = _primary(confirmation_results)
+    best_confirmation = primary_confirmation
     heldout_baseline = None
     heldout_results: tuple[CandidateEvalResult, ...] = ()
+    primary_heldout = None
     if heldout_examples:
         heldout_baseline = evaluate_program(
             program=program,
@@ -154,6 +166,7 @@ def run_openai_closed_loop_benchmark(
             cost_meter=cost_meter,
             run_id="closed_loop_heldout_baseline",
         )
+        heldout_records = optimizer_result.final_records[:1]
         heldout_results = tuple(
             evaluate_program(
                 program=record.program,
@@ -168,15 +181,18 @@ def run_openai_closed_loop_benchmark(
                 cost_meter=cost_meter,
                 run_id=f"closed_loop_heldout_{index}_{record.schema.schema_id}",
             )
-            for index, record in enumerate(optimizer_result.final_records)
+            for index, record in enumerate(heldout_records)
         )
+        primary_heldout = _primary(heldout_results)
     result = OpenAIClosedLoopBenchmarkResult(
         optimizer_result=optimizer_result,
         confirmation_baseline=confirmation_baseline,
         confirmation_results=confirmation_results,
+        primary_confirmation=primary_confirmation,
         best_confirmation=best_confirmation,
         heldout_baseline=heldout_baseline,
         heldout_results=heldout_results,
+        primary_heldout=primary_heldout,
         best_heldout=_best(heldout_results),
         artifacts={},
     )
@@ -189,8 +205,12 @@ def run_openai_closed_loop_benchmark(
                 "summary": result.summary(),
                 "confirmation_baseline": confirmation_baseline.to_dict(),
                 "confirmation_results": [item.to_dict() for item in confirmation_results],
+                "primary_confirmation": (
+                    primary_confirmation.to_dict() if primary_confirmation else None
+                ),
                 "heldout_baseline": heldout_baseline.to_dict() if heldout_baseline else None,
                 "heldout_results": [item.to_dict() for item in heldout_results],
+                "primary_heldout": primary_heldout.to_dict() if primary_heldout else None,
             },
             artifact_root / "results" / "closed_loop_summary.json",
         )
@@ -199,14 +219,20 @@ def run_openai_closed_loop_benchmark(
             optimizer_result=optimizer_result,
             confirmation_baseline=confirmation_baseline,
             confirmation_results=confirmation_results,
+            primary_confirmation=primary_confirmation,
             best_confirmation=best_confirmation,
             heldout_baseline=heldout_baseline,
             heldout_results=heldout_results,
+            primary_heldout=primary_heldout,
             best_heldout=_best(heldout_results),
             artifacts=artifacts,
         )
         write_json(result.summary(), artifact_root / "results" / "closed_loop_brief.json")
     return result
+
+
+def _primary(results: tuple[CandidateEvalResult, ...]) -> CandidateEvalResult | None:
+    return results[0] if results else None
 
 
 def _best(results: tuple[CandidateEvalResult, ...]) -> CandidateEvalResult | None:

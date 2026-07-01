@@ -24,6 +24,8 @@ from schemaevo.schemas.random_controls import make_random_schema_controls
 from schemaevo.schemas.serialization import freeze_jsonl, write_json
 from schemaevo.utils.progress import ProgressMode, progress_iter, progress_status
 
+CONTROL_SCHEMA_TYPES = frozenset({"random", "validator_only"})
+
 
 @dataclass(frozen=True)
 class FixedPoolConfig:
@@ -101,6 +103,17 @@ class MVPDecision:
     reasons: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class ControlGuardrail:
+    control_in_top_k_warning: bool
+    selection_top_k_control_schema_ids: tuple[str, ...]
+    confirmation_top_k_control_schema_ids: tuple[str, ...]
+    best_control_schema_id: str | None
+    best_control_confirmation_mean: float | None
+    best_control_vs_primary_delta: float | None
+    warning: str | None
+
+
 @dataclass
 class FixedPoolResult:
     baseline_selection_result: CandidateEvalResult
@@ -118,6 +131,7 @@ class FixedPoolResult:
     heldout_test_stats: PairedComparison | None
     field_ablation_results: tuple[FieldAblationResult, ...]
     decision: MVPDecision
+    control_guardrail: ControlGuardrail
     cost_summary: dict[str, float | int]
     budget_summary: dict[str, float | int | bool | None]
     proposal_usage: dict[str, float | int]
@@ -135,6 +149,7 @@ class FixedPoolResult:
             "heldout_test_mean": self.heldout_test_result.mean_score if self.heldout_test_result else None,
             "score_delta": self.decision.score_delta,
             "invalid_output_rate": self.best_confirmation_result.invalid_output_rate,
+            "control_guardrail": asdict(self.control_guardrail),
             "field_ablations": [asdict(result) for result in self.field_ablation_results],
             "cost_summary": self.cost_summary,
             "budget": self.budget_summary,
@@ -477,6 +492,12 @@ def run_fixed_pool_schema_mvp(
                 progress=config.progress,
             )
         )
+    control_guardrail = _make_control_guardrail(
+        schema_pool=schema_pool,
+        top_selection_results=top_selection_results,
+        confirmation_results=confirmation_results,
+        primary_confirmation=primary_confirmation,
+    )
     decision = _make_decision(
         baseline=baseline_confirmation,
         best=primary_confirmation,
@@ -529,6 +550,7 @@ def run_fixed_pool_schema_mvp(
                 if heldout_test_stats
                 else None,
                 "field_ablation_results": [asdict(result) for result in field_ablation_results],
+                "control_guardrail": asdict(control_guardrail),
                 "cost_summary": cost_summary,
                 "budget": budget_summary,
                 "proposal_usage": proposal_usage,
@@ -554,6 +576,7 @@ def run_fixed_pool_schema_mvp(
         heldout_test_stats=heldout_test_stats,
         field_ablation_results=field_ablation_results,
         decision=decision,
+        control_guardrail=control_guardrail,
         cost_summary=cost_summary,
         budget_summary=budget_summary,
         proposal_usage=proposal_usage,
@@ -1440,6 +1463,57 @@ def _corrected_confirmation_stats(
         )
         for index, (candidate, stats) in enumerate(zip(candidates, raw_stats))
     }
+
+
+def _make_control_guardrail(
+    *,
+    schema_pool: tuple[SchemaCandidate, ...],
+    top_selection_results: tuple[CandidateEvalResult, ...],
+    confirmation_results: tuple[CandidateEvalResult, ...],
+    primary_confirmation: CandidateEvalResult,
+) -> ControlGuardrail:
+    schema_by_id = {schema.schema_id: schema for schema in schema_pool}
+    selection_control_ids = tuple(
+        result.schema_id
+        for result in top_selection_results
+        if _is_control_schema(schema_by_id.get(result.schema_id))
+    )
+    confirmation_control_results = tuple(
+        result
+        for result in confirmation_results
+        if _is_control_schema(schema_by_id.get(result.schema_id))
+    )
+    best_control = (
+        max(
+            confirmation_control_results,
+            key=lambda result: (result.mean_score, -result.invalid_output_rate, result.schema_id),
+        )
+        if confirmation_control_results
+        else None
+    )
+    warning = bool(selection_control_ids or confirmation_control_results)
+    warning_text = (
+        "Control schema appeared in selection/confirmation top-k; treat positive schema claims as null-risk."
+        if warning
+        else None
+    )
+    return ControlGuardrail(
+        control_in_top_k_warning=warning,
+        selection_top_k_control_schema_ids=selection_control_ids,
+        confirmation_top_k_control_schema_ids=tuple(
+            result.schema_id for result in confirmation_control_results
+        ),
+        best_control_schema_id=best_control.schema_id if best_control else None,
+        best_control_confirmation_mean=best_control.mean_score if best_control else None,
+        best_control_vs_primary_delta=(
+            best_control.mean_score - primary_confirmation.mean_score if best_control else None
+        ),
+        warning=warning_text,
+    )
+
+
+def _is_control_schema(schema: SchemaCandidate | None) -> bool:
+    return bool(schema and schema.control_type in CONTROL_SCHEMA_TYPES)
 
 
 def _make_decision(

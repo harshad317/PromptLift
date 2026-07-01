@@ -427,12 +427,12 @@ Common fixed-pool outputs:
 | Path | Contents |
 | --- | --- |
 | `schemas/frozen_pool.jsonl` | Frozen schema candidates that survived static checks. |
-| `results/mvp_summary.json` | Main fixed-pool summary, decision, stats, cost, budget, field ablations, and artifact paths. |
+| `results/mvp_summary.json` | Main fixed-pool summary, decision, stats, cost, budget, control-schema guardrail, field ablations, and artifact paths. |
 | `results/*_scores.jsonl` | Per-example scores, final outputs, validity, calls, tokens, cost, and latency. |
 | `logs/*.jsonl` | Per-module call logs with prompt/schema hashes, validation data, token counts, and payload paths. |
 | `payloads/<run>/<example>/<module>.json` | Raw module outputs. |
 | `cost_ledgers/*.jsonl` | Per-call cost ledger entries. |
-| `rollout_cache/*.json` | Content-addressed cached predictions keyed by program, schema, example, seed, and intervention. |
+| `rollout_cache/*.json` | Content-addressed cached predictions keyed by program/schema/runtime metadata, full example payload, seed, and intervention. |
 
 Closed-loop outputs:
 

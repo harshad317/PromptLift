@@ -10,9 +10,14 @@ import yaml
 
 from schemaevo.adapters.dspy import DSpyModuleConfig, dspy_program_to_lm_program
 from schemaevo.adapters.openai import OpenAIModuleConfig, openai_modules_to_lm_program
+from schemaevo.benchmarks.openai_closed_loop import (
+    _best as _closed_loop_best,
+    _primary as _closed_loop_primary,
+)
 from schemaevo.benchmarks.readiness import check_benchmark_readiness, check_fixed_pool_split_readiness
 from schemaevo.benchmarks.openai_fixed_pool import (
     OpenAIFixedPoolBenchmarkConfig,
+    _scorer_for_dataset,
     run_openai_fixed_pool_benchmark,
 )
 from schemaevo.cli import _apply_budget_overrides, main as cli_main
@@ -28,14 +33,18 @@ from schemaevo.examples.toy_multihop import (
     toy_scorer,
 )
 from schemaevo.eval.cache import RolloutCache
-from schemaevo.eval.scoring import evaluate_program
+from schemaevo.eval.scoring import CandidateEvalResult, evaluate_program
 from schemaevo.experiments.budget_pareto import build_budget_pareto_report
 from schemaevo.experiments.causal_pilot import build_causal_pilot_report
 from schemaevo.experiments.deployment_invariance import build_fixed_pool_deployment_report
 from schemaevo.experiments.external_prompt_optimizer import ExternalPromptOptimizer
 from schemaevo.experiments.composability import run_prompt_optimizer_then_schemaevo
 from schemaevo.experiments.transfer import run_openai_cross_model_schema_transfer
-from schemaevo.optimizers.fixed_pool_schema import FixedPoolConfig, run_fixed_pool_schema_mvp
+from schemaevo.optimizers.fixed_pool_schema import (
+    FixedPoolConfig,
+    _make_control_guardrail,
+    run_fixed_pool_schema_mvp,
+)
 from schemaevo.optimizers.schema_evo import SchemaEvoConfig, merge_schema_candidates, schema_evo_optimize
 from schemaevo.programs.base import ProgramExample
 from schemaevo.programs.call_graph import assert_same_call_graph, extract_call_graph
@@ -90,6 +99,62 @@ def test_compile_schema_program_preserves_call_graph_and_freezes_prompt_prefix()
     assert compiled.modules[0].prompt.startswith(base.modules[0].prompt)
     assert CONTRACT_START in compiled.modules[0].prompt
     assert "bridge_entity" in compiled.modules[0].signature.output_fields
+
+
+def test_schema_candidate_rejects_duplicate_field_names_across_modules():
+    planner_field = SchemaField(
+        name="shared_signal",
+        type="string",
+        description="Planner signal.",
+        required=False,
+        producer_module="planner",
+        consumer_modules=("answerer",),
+    )
+    answerer_field = SchemaField(
+        name="shared_signal",
+        type="string",
+        description="Answerer signal.",
+        required=False,
+        producer_module="answerer",
+        consumer_modules=("planner",),
+    )
+
+    with pytest.raises(ValueError, match="duplicate schema field name"):
+        SchemaCandidate(
+            schema_id="duplicate_global_field",
+            parent_schema_id=None,
+            task="test",
+            module_fields={"planner": (planner_field,), "answerer": (answerer_field,)},
+            consumption_rules=(),
+            validators={},
+            schema_token_budget=128,
+            mutation_history=(),
+            proposer_seed=0,
+        )
+
+
+def test_schema_candidate_rejects_unknown_validator_fields():
+    field = SchemaField(
+        name="known_signal",
+        type="string",
+        description="Known signal.",
+        required=False,
+        producer_module="planner",
+        consumer_modules=("answerer",),
+    )
+
+    with pytest.raises(ValueError, match="validators reference unknown fields"):
+        SchemaCandidate(
+            schema_id="stale_validator",
+            parent_schema_id=None,
+            task="test",
+            module_fields={"planner": (field,)},
+            consumption_rules=(),
+            validators={"stale_signal": "non_empty"},
+            schema_token_budget=128,
+            mutation_history=(),
+            proposer_seed=0,
+        )
 
 
 def test_call_graph_rejects_changed_demo_ids():
@@ -563,6 +628,7 @@ def test_fixed_pool_schema_mvp_runs_end_to_end(tmp_path):
     with open(tmp_path / "results" / "mvp_summary.json", "r", encoding="utf-8") as handle:
         summary = json.load(handle)
     assert summary["decision"]["proceed"] is True
+    assert "control_guardrail" in summary
 
 
 def test_fixed_pool_rejects_split_leakage(tmp_path):
@@ -619,6 +685,53 @@ def test_fixed_pool_budget_reserves_confirmation_and_trims_candidates(tmp_path):
     assert len(result.confirmation_results) == 1
     assert result.primary_confirmation_result.schema_id == result.top_selection_results[0].schema_id
     assert result.field_ablation_results == ()
+
+
+def test_fixed_pool_control_guardrail_flags_controls_in_top_k():
+    semantic = make_hotpotqa_schema_candidate(module_names=("planner", "answerer"), seed=0)
+    control_field = SchemaField(
+        name="opaque_key",
+        type="string",
+        description="Opaque control field.",
+        required=False,
+        producer_module="planner",
+        consumer_modules=("answerer",),
+    )
+    control = SchemaCandidate(
+        schema_id="control_schema",
+        parent_schema_id=None,
+        task="HotpotQA",
+        module_fields={"planner": (control_field,)},
+        consumption_rules=(
+            ConsumptionRule(
+                consumer_module="answerer",
+                field_name="opaque_key",
+                instruction="Use only if relevant.",
+                required_behavior="Do not infer new evidence.",
+                fallback_if_missing="Use original behavior.",
+            ),
+        ),
+        validators={},
+        schema_token_budget=128,
+        mutation_history=("random_schema_control",),
+        proposer_seed=0,
+        control_type="random",
+    )
+    primary = _candidate_eval_result(schema_id=semantic.schema_id, mean_score=0.6)
+    control_result = _candidate_eval_result(schema_id=control.schema_id, mean_score=0.7)
+
+    guardrail = _make_control_guardrail(
+        schema_pool=(semantic, control),
+        top_selection_results=(primary, control_result),
+        confirmation_results=(primary, control_result),
+        primary_confirmation=primary,
+    )
+
+    assert guardrail.control_in_top_k_warning
+    assert guardrail.selection_top_k_control_schema_ids == (control.schema_id,)
+    assert guardrail.confirmation_top_k_control_schema_ids == (control.schema_id,)
+    assert guardrail.best_control_schema_id == control.schema_id
+    assert guardrail.best_control_vs_primary_delta == pytest.approx(0.1)
 
 
 def test_fixed_pool_records_schema_proposal_usage(tmp_path):
@@ -1138,6 +1251,14 @@ def test_closed_loop_budget_stops_candidate_evaluations(tmp_path):
     assert len(result.evaluated_records) <= 1
 
 
+def test_closed_loop_primary_result_is_optimizer_locked_not_confirmation_max():
+    first = _candidate_eval_result(schema_id="schema_first", mean_score=0.2)
+    second = _candidate_eval_result(schema_id="schema_second", mean_score=0.9)
+
+    assert _closed_loop_primary((first, second)) is first
+    assert _closed_loop_best((first, second)) is second
+
+
 def test_closed_loop_token_budget_prevents_starting_over_budget_candidates():
     config = SchemaEvoConfig(
         task="toy_multihop",
@@ -1184,6 +1305,39 @@ def test_schema_merge_combines_complementary_fields():
     assert schemas[0].schema_id in merged.parent_schema_id
 
 
+def _candidate_eval_result(*, schema_id: str, mean_score: float) -> CandidateEvalResult:
+    return CandidateEvalResult(
+        run_id=f"run_{schema_id}",
+        method="test",
+        candidate_id=schema_id,
+        schema_id=schema_id,
+        task="test",
+        split="test",
+        n_examples=1,
+        mean_score=mean_score,
+        standard_error=0.0,
+        score_ci_low=mean_score,
+        score_ci_high=mean_score,
+        per_example_scores_path="",
+        target_task_calls=0,
+        optimizer_proposal_calls=0,
+        optimizer_reflection_calls=0,
+        schema_generation_calls=0,
+        schema_validation_repair_calls=0,
+        retriever_calls=0,
+        prompt_tokens=0,
+        completion_tokens=0,
+        dollar_cost=0.0,
+        wall_clock_seconds=0.0,
+        p50_latency_ms=0.0,
+        p95_latency_ms=0.0,
+        invalid_output_rate=0.0,
+        schema_validation_failure_count=0,
+        invalid_score_policy="zero",
+        per_example_scores=(mean_score,),
+    )
+
+
 def test_rollout_cache_reuses_identical_program_example_seed(tmp_path):
     program = build_toy_program()
     calls = {"planner": 0}
@@ -1217,6 +1371,27 @@ def test_rollout_cache_reuses_identical_program_example_seed(tmp_path):
     )
 
     assert calls["planner"] == 1
+
+
+def test_rollout_cache_key_includes_example_payload_and_program_metadata(tmp_path):
+    cache = RolloutCache(tmp_path / "cache")
+    program = build_toy_program()
+    example = make_toy_examples("cache_identity", 1)[0]
+    same_id_changed_target = ProgramExample(
+        example_id=example.example_id,
+        split=example.split,
+        inputs=dict(example.inputs),
+        expected={"answer": "different"},
+        metadata=dict(example.metadata),
+    )
+
+    original_key = cache.key(program=program, example=example, seed=1)
+    changed_example_key = cache.key(program=program, example=same_id_changed_target, seed=1)
+    program.modules[0].metadata["temperature"] = 0
+    changed_program_key = cache.key(program=program, example=example, seed=1)
+
+    assert changed_example_key != original_key
+    assert changed_program_key != original_key
 
 
 def test_dspy_adapter_wraps_callable_and_preserves_demo_ids():
@@ -1608,6 +1783,24 @@ def test_benchmark_scorers_normalize_hotpotqa_and_hover_outputs(tmp_path):
 
     assert hotpotqa_exact_match(hotpot_example, Prediction({"answer": "compiler"})) == 1.0
     assert hover_label_accuracy(hover_example, Prediction({"label": "supported"})) == 1.0
+
+
+def test_openai_hotpotqa_benchmark_uses_preregistered_exact_match(tmp_path):
+    hotpot_path = tmp_path / "hotpot.json"
+    hotpot_path.write_text(
+        json.dumps([{"_id": "h1", "question": "Q?", "answer": "compiler", "context": []}]),
+        encoding="utf-8",
+    )
+    example = load_hotpotqa_examples(hotpot_path, split="dev")[0]
+
+    class Prediction:
+        def __init__(self, final_output):
+            self.final_output = final_output
+
+    scorer = _scorer_for_dataset("hotpotqa")
+
+    assert scorer(example, Prediction({"answer": "the compiler"})) == 1.0
+    assert scorer(example, Prediction({"answer": "the compiler was correct"})) == 0.0
 
 
 def test_benchmark_readiness_reports_local_data_and_missing_key(tmp_path, monkeypatch):

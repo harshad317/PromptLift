@@ -858,7 +858,7 @@ def merge_schema_candidates(
     if len(schemas) < 2:
         raise ValueError("at least two schemas are required to merge")
     module_fields: dict[str, list[SchemaField]] = {}
-    seen_fields: set[tuple[str, str]] = set()
+    seen_fields: set[str] = set()
     rules = []
     validators: dict[str, str] = {}
     parent_ids = []
@@ -866,10 +866,9 @@ def merge_schema_candidates(
         parent_ids.append(schema.schema_id)
         for module_name, fields in schema.module_fields.items():
             for field in fields:
-                key = (module_name, field.name)
-                if key in seen_fields:
+                if field.name in seen_fields:
                     continue
-                seen_fields.add(key)
+                seen_fields.add(field.name)
                 module_fields.setdefault(module_name, []).append(field)
                 validators.setdefault(field.name, schema.validators.get(field.name, field.validation_rule or ""))
         for rule in schema.consumption_rules:

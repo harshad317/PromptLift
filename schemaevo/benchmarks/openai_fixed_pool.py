@@ -7,7 +7,7 @@ from typing import Any, Literal
 from schemaevo.adapters.openai import OpenAIModuleConfig, openai_modules_to_lm_program
 from schemaevo.datasets.hotpotqa import load_hotpotqa_examples
 from schemaevo.datasets.hover import load_hover_examples
-from schemaevo.datasets.scorers import hotpotqa_exact_match, hotpotqa_f1, hover_label_accuracy
+from schemaevo.datasets.scorers import hotpotqa_exact_match, hover_label_accuracy
 from schemaevo.eval.scoring import Scorer
 from schemaevo.optimizers.fixed_pool_schema import FixedPoolConfig, FixedPoolResult, run_fixed_pool_schema_mvp
 from schemaevo.programs.base import LMProgram, ProgramExample
@@ -254,7 +254,7 @@ def _load_examples(
 
 def _scorer_for_dataset(dataset: DatasetName) -> Scorer:
     if dataset == "hotpotqa":
-        return hotpotqa_f1
+        return hotpotqa_exact_match
     if dataset == "hover":
         return hover_label_accuracy
     raise ValueError(f"unsupported dataset: {dataset}")
